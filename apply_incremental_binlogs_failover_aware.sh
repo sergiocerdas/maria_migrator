@@ -88,7 +88,8 @@ log "LOG_FILE=$LOG_FILE"
 section "DETERMINE LOCAL SERVER ID"
 
 HOSTNAME_SHORT=$(hostname -s)
-LOCAL_SERVER_ID="${HOSTNAME_SHORT:1:1}"
+#LOCAL_SERVER_ID="${HOSTNAME_SHORT:1:1}"
+LOCAL_SERVER_ID=$(mysql --host $HOSTNAME --user=mysql01 --port=$PORT --skip-column-names --silent -e "SELECT @@server_id;")
 
 log "Hostname detected: $HOSTNAME_SHORT"
 log "Inferred local server-id: $LOCAL_SERVER_ID"
@@ -98,7 +99,8 @@ if [[ ! "$LOCAL_SERVER_ID" =~ ^[12]$ ]]; then
     exit 1
 fi
 
-OTHER_SERVER_ID=$([[ "$LOCAL_SERVER_ID" == "1" ]] && echo 2 || echo 1)
+#OTHER_SERVER_ID=$([[ "$LOCAL_SERVER_ID" == "1" ]] && echo 2 || echo 1)
+OTHER_SERVER_ID=$(mysql --host $CLUSTER_NODE_2 --user=mysql01 --port=$PORT --skip-column-names --silent -e "SELECT @@server_id;")
 
 log "Hostname: $HOSTNAME_SHORT"
 log "Local server_id: $LOCAL_SERVER_ID"
@@ -223,7 +225,65 @@ SQL_FILE="$WORKDIR/$CURRENT_BINLOG.sql"
 ERR_FILE="$WORKDIR/$CURRENT_BINLOG.err"
 
 log "BINLOG_PATH=$BINLOG_PATH"
-log "SQL_FILE=$SQL_FILE"
+log "SQL_FILE=$SQL_FILE"section "FAILOVER RESUME CHECK"
+
+if [[ -f "$FAILOVER_FILE" ]]; then
+    log "Failover file detected: $FAILOVER_FILE"
+    log "Attempting GTID-based resume"
+
+    FAILOVER_GTID=$(grep -oE 'FAILOVER_GTID[:=][[:space:]]*[0-9-]+' "$FAILOVER_FILE" \
+        | sed -E 's/.*[:=][[:space:]]*//')
+
+    if [[ -z "$FAILOVER_GTID" ]]; then
+        log "ERROR: Could not extract FAILOVER_GTID from file"
+        exit 1
+    fi
+
+    log "Failover GTID found: $FAILOVER_GTID"
+    log "Searching local binlogs for GTID..."
+
+    FOUND_LINE=""
+
+    for f in "$BINLOG_DIR"/binlogs*[0-9]; do
+        RESULT=$(mariadb-binlog "$f" \
+            | grep -n "GTID $FAILOVER_GTID" \
+            | sed "s|^|$f:|" || true)
+
+        if [[ -n "$RESULT" ]]; then
+            FOUND_LINE="$RESULT"
+            break
+        fi
+    done
+
+    if [[ -z "$FOUND_LINE" ]]; then
+        log "ERROR: GTID $FAILOVER_GTID not found in local binlogs"
+        exit 1
+    fi
+
+    log "GTID located:"
+    log "$FOUND_LINE"
+
+    ############################################
+    # Extract binlog file and end_log_pos
+    ############################################
+
+    # File is before first colon
+    CURRENT_BINLOG=$(echo "$FOUND_LINE" | cut -d':' -f1 | xargs basename)
+
+    # Extract end_log_pos value
+    CURRENT_POS=$(echo "$FOUND_LINE" \
+        | grep -oE 'end_log_pos [0-9]+' \
+        | awk '{print $2}')
+
+    if [[ -z "$CURRENT_BINLOG" || -z "$CURRENT_POS" ]]; then
+        log "ERROR: Failed to extract binlog name or position"
+        exit 1
+    fi
+
+    log "Resume binlog determined:"
+    log "  Binlog   : $CURRENT_BINLOG"
+    log "  Position : $CURRENT_POS"
+
 log "ERR_FILE=$ERR_FILE"
 
 ############################################
@@ -287,10 +347,10 @@ if [[ -n "$FAILOVER_LINE" ]]; then
         FAILOVER_POS=$(echo "$FAILOVER_LINE" | sed -n 's/.*end_log_pos \([0-9]\+\).*/\1/p')
         FAILOVER_SERVER_ID="$OTHER_SERVER_ID"
         FAILOVER_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-	echo "FAILOVER_GTID: $FAILOVER_GTID"
-	echo "FAILOVER_POS:$FAILOVER_POS"
-	echo "FAILOVER_SERVER_ID: $FAILOVER_SERVER_ID"
-	echo "FAILOVER_TIME: $FAILOVER_TIME"
+        echo "FAILOVER_GTID: $FAILOVER_GTID"
+        echo "FAILOVER_POS:$FAILOVER_POS"
+        echo "FAILOVER_SERVER_ID: $FAILOVER_SERVER_ID"
+        echo "FAILOVER_TIME: $FAILOVER_TIME"
     } > "$FAILOVER_FILE"
 
     log "FAILOVER DETECTED"
@@ -327,11 +387,14 @@ if [[ -n "$FAILOVER_LINE" ]]; then
 
         if scp "$FAILOVER_FILE" "$NEW_PRIMARY_HOST:$FAILOVER_FILE"; then
             log "Failover file successfully copied to $NEW_PRIMARY_HOST"
-	    rm -f "$FAILOVER_FILE"
-
+            ############################################
+            # Remove failover file (handoff complete)
+            ############################################
+            rm -f "$FAILOVER_FILE"
+            log "Failover file consumed and removed"
         else
             log "ERROR: Failed to copy failover file to $NEW_PRIMARY_HOST"
-	    log "You may attempt to copy the file manually and remove the failover file locally before moving forward"
+	        log "You may attempt to copy the file manually and remove the failover file locally before moving forward"
         fi
     fi
 
