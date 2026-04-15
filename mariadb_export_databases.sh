@@ -80,7 +80,7 @@ echo "[INFO] Excluding databases: ${DEFAULT_EXCLUDES[*]} ${EXCLUDE_DBS[*]}"
 # Execute mysqldump
 mysqldump --user="$MYSQL_USER" --host="$MYSQL_HOST" --port="$MYSQL_PORT" \
     --single-transaction --quick --master-data=2 --max_allowed_packet=1GB \
-    --events --routines --triggers --all-databases $IGNORE_ARGS  > "$OUTPUT_FILE"
+    --force --events --routines --triggers --all-databases $IGNORE_ARGS  > "$OUTPUT_FILE"
 
 echo "[INFO] Database export completed successfully to $OUTPUT_FILE"
 

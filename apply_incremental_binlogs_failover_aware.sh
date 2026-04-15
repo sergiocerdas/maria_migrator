@@ -29,19 +29,18 @@ fi
 ############################################
 # CONFIGURATION
 ############################################
-PORT=3902
+PORT=4065
 BINLOG_DIR="/instances/mysql_db$PORT/binlogs"
-WORKDIR="/instances/mysql_db$PORT/scriptsMig/binlog_apply"
+WORKDIR="/instances/mysql_db$PORT/scriptsMig/githubversion/binlog_apply"
 
 STATE_FILE="$WORKDIR/state.env"
 LOG_FILE="$WORKDIR/run.log"
 FAILOVER_FILE="$WORKDIR/failover_detected.txt"
 
-
-TARGET_HOST="10-11-227-150.dbaas.intel.com"
+TARGET_HOST="10-11-180-79.dbaas.intel.com"
 TARGET_PORT=3306
-TARGET_USER="ccggv3lndmtmq04qrqxa_dbaas"
-TARGET_PASS="exangCxnikk=Y2bI!i5.ZT5zVo!-QdV5"
+TARGET_USER="b00cvzpaccul4dp4z8j5_dbaas"
+TARGET_PASS="J_BK=t2o_K3!1hV;tR;j5kgDirndI-Ge"
 
 MYSQL_BINLOG="/usr/bin/mariadb-binlog"
 MYSQL="/usr/bin/mariadb"
@@ -83,9 +82,9 @@ log "STATE_FILE=$STATE_FILE"
 log "LOG_FILE=$LOG_FILE"
 
 ############################################
-# DETERMINE LOCAL SERVER ID
+# DETERMINE SERVER ID
 ############################################
-section "DETERMINE LOCAL SERVER ID"
+section "DETERMINE SERVER ID"
 
 HOSTNAME_SHORT=$(hostname -s)
 #LOCAL_SERVER_ID="${HOSTNAME_SHORT:1:1}"
@@ -225,65 +224,7 @@ SQL_FILE="$WORKDIR/$CURRENT_BINLOG.sql"
 ERR_FILE="$WORKDIR/$CURRENT_BINLOG.err"
 
 log "BINLOG_PATH=$BINLOG_PATH"
-log "SQL_FILE=$SQL_FILE"section "FAILOVER RESUME CHECK"
-
-if [[ -f "$FAILOVER_FILE" ]]; then
-    log "Failover file detected: $FAILOVER_FILE"
-    log "Attempting GTID-based resume"
-
-    FAILOVER_GTID=$(grep -oE 'FAILOVER_GTID[:=][[:space:]]*[0-9-]+' "$FAILOVER_FILE" \
-        | sed -E 's/.*[:=][[:space:]]*//')
-
-    if [[ -z "$FAILOVER_GTID" ]]; then
-        log "ERROR: Could not extract FAILOVER_GTID from file"
-        exit 1
-    fi
-
-    log "Failover GTID found: $FAILOVER_GTID"
-    log "Searching local binlogs for GTID..."
-
-    FOUND_LINE=""
-
-    for f in "$BINLOG_DIR"/binlogs*[0-9]; do
-        RESULT=$(mariadb-binlog "$f" \
-            | grep -n "GTID $FAILOVER_GTID" \
-            | sed "s|^|$f:|" || true)
-
-        if [[ -n "$RESULT" ]]; then
-            FOUND_LINE="$RESULT"
-            break
-        fi
-    done
-
-    if [[ -z "$FOUND_LINE" ]]; then
-        log "ERROR: GTID $FAILOVER_GTID not found in local binlogs"
-        exit 1
-    fi
-
-    log "GTID located:"
-    log "$FOUND_LINE"
-
-    ############################################
-    # Extract binlog file and end_log_pos
-    ############################################
-
-    # File is before first colon
-    CURRENT_BINLOG=$(echo "$FOUND_LINE" | cut -d':' -f1 | xargs basename)
-
-    # Extract end_log_pos value
-    CURRENT_POS=$(echo "$FOUND_LINE" \
-        | grep -oE 'end_log_pos [0-9]+' \
-        | awk '{print $2}')
-
-    if [[ -z "$CURRENT_BINLOG" || -z "$CURRENT_POS" ]]; then
-        log "ERROR: Failed to extract binlog name or position"
-        exit 1
-    fi
-
-    log "Resume binlog determined:"
-    log "  Binlog   : $CURRENT_BINLOG"
-    log "  Position : $CURRENT_POS"
-
+log "SQL_FILE=$SQL_FILE"
 log "ERR_FILE=$ERR_FILE"
 
 ############################################
@@ -459,4 +400,5 @@ rm -f "$SQL_FILE" "$ERR_FILE"
 ############################################
 section "SCRIPT END"
 log "Execution completed successfully"
+
 
