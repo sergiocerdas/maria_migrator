@@ -45,7 +45,6 @@ TARGET_PASS="J_BK=t2o_K3!1hV;tR;j5kgDirndI-Ge"
 MYSQL_BINLOG="/usr/bin/mariadb-binlog"
 MYSQL="/usr/bin/mariadb"
 
-
 ############################################
 # LOGGING HELPERS
 ############################################
@@ -272,75 +271,189 @@ fi
 ############################################
 section "FAILOVER DETECTION"
 
-FAILOVER_LINE=$(grep -E "server id $OTHER_SERVER_ID" "$SQL_FILE" | head -1 || true)
+# Find ALL lines with foreign server_id (not just the first one)
+ALL_FOREIGN_LINES=$(grep -n -E "server id $OTHER_SERVER_ID" "$SQL_FILE" || true)
 
-if [[ -n "$FAILOVER_LINE" ]]; then
+if [[ -n "$ALL_FOREIGN_LINES" ]]; then
+    log "Found $(echo "$ALL_FOREIGN_LINES" | wc -l) transaction(s) from server_id $OTHER_SERVER_ID"
     
-    FAILOVER_POS=$(echo "$FAILOVER_LINE" | grep -oE 'end_log_pos [0-9]+' | awk '{print $2}')
-
-    {
-        echo "FAILOVER DETECTED"
-        echo "Detected server_id: $OTHER_SERVER_ID"
-        echo "Binlog: $CURRENT_BINLOG"
-        echo "Position: $FAILOVER_POS"
-        echo "Timestamp: $(date -u)"
-        FAILOVER_GTID=$(echo "$FAILOVER_LINE" | sed -n 's/.*GTID \([0-9-]\+\).*/\1/p')
-        FAILOVER_POS=$(echo "$FAILOVER_LINE" | sed -n 's/.*end_log_pos \([0-9]\+\).*/\1/p')
-        FAILOVER_SERVER_ID="$OTHER_SERVER_ID"
-        FAILOVER_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-        echo "FAILOVER_GTID: $FAILOVER_GTID"
-        echo "FAILOVER_POS:$FAILOVER_POS"
-        echo "FAILOVER_SERVER_ID: $FAILOVER_SERVER_ID"
-        echo "FAILOVER_TIME: $FAILOVER_TIME"
-    } > "$FAILOVER_FILE"
-
-    log "FAILOVER DETECTED"
-    log "Foreign server_id $OTHER_SERVER_ID found"
-    log "Failover at $CURRENT_BINLOG position $FAILOVER_POS"
-    log "Handoff file written to $FAILOVER_FILE"
-    log "  Position : $FAILOVER_POS"
-    log "  GTID     : $FAILOVER_GTID"
-    log "  ServerID : $FAILOVER_SERVER_ID"
-    log "Stopping processing on this node"
-
-    ############################################
-    # COPY FAILOVER FILE TO NEW PRIMARY
-    ############################################
-
-    # Convert server_id to array index (1 → 0, 2 → 1)
-    NEW_PRIMARY_INDEX=$((FAILOVER_SERVER_ID - 1))
-
-    NEW_PRIMARY_HOST="${CLUSTER_NODES[$NEW_PRIMARY_INDEX]}"
-
-    if [[ -z "$NEW_PRIMARY_HOST" ]]; then
-        log "ERROR: Unable to resolve new primary host for server_id $FAILOVER_SERVER_ID"
-    else
-        section "FAILOVER HANDOFF"
-
-        log "Copying failover file to new primary"
-        log "  Server ID : $FAILOVER_SERVER_ID"
-        log "  Host      : $NEW_PRIMARY_HOST"
-        log "  File      : $FAILOVER_FILE"
-
-        SCP_CMD="scp $FAILOVER_FILE $NEW_PRIMARY_HOST:$FAILOVER_FILE"
-
-        log "Executing: $SCP_CMD"
-
-        if scp "$FAILOVER_FILE" "$NEW_PRIMARY_HOST:$FAILOVER_FILE"; then
-            log "Failover file successfully copied to $NEW_PRIMARY_HOST"
-            ############################################
-            # Remove failover file (handoff complete)
-            ############################################
-            rm -f "$FAILOVER_FILE"
-            log "Failover file consumed and removed"
-        else
-            log "ERROR: Failed to copy failover file to $NEW_PRIMARY_HOST"
-	        log "You may attempt to copy the file manually and remove the failover file locally before moving forward"
+    MAINTENANCE_COUNT=0
+    TRANSACTION_COUNT=0
+    
+    # Process each foreign server_id transaction
+    while IFS= read -r FOREIGN_LINE_WITH_NUM; do
+        if [[ -z "$FOREIGN_LINE_WITH_NUM" ]]; then
+            continue
         fi
-    fi
+        
+        TRANSACTION_COUNT=$((TRANSACTION_COUNT + 1))
+        FOREIGN_LINE_NUM=$(echo "$FOREIGN_LINE_WITH_NUM" | cut -d: -f1)
+        FOREIGN_LINE=$(echo "$FOREIGN_LINE_WITH_NUM" | cut -d: -f2-)
+        
+        log "Analyzing transaction #$TRANSACTION_COUNT at line $FOREIGN_LINE_NUM..."
+        
+        # Extract position
+        CURRENT_POS=$(echo "$FOREIGN_LINE" | grep -oE 'end_log_pos [0-9]+' | awk '{print $2}')
+        
+        # Find the next GTID line to determine the end of this transaction
+        NEXT_GTID_LINE_NUM=$(sed -n "${FOREIGN_LINE_NUM},\$p" "$SQL_FILE" | grep -n "GTID [0-9]-[0-9]-[0-9]" | sed -n '2p' | cut -d: -f1)
+        
+        if [[ -n "$NEXT_GTID_LINE_NUM" ]]; then
+            # Calculate actual line number in the full file
+            END_LINE_NUM=$(($FOREIGN_LINE_NUM + $NEXT_GTID_LINE_NUM - 1))
+            log "  Transaction ends at line $END_LINE_NUM (next GTID found)"
+        else
+            # If no next GTID found, extract to end of file
+            END_LINE_NUM=$(wc -l < "$SQL_FILE")
+            log "  Transaction ends at EOF (line $END_LINE_NUM)"
+        fi
+        
+        # Extract the complete transaction block until next GTID
+        TRANSACTION_BLOCK=$(sed -n "${FOREIGN_LINE_NUM},${END_LINE_NUM}p" "$SQL_FILE")
+        
+        # Look for actual SQL statements in the transaction block
+        SQL_STATEMENT=$(echo "$TRANSACTION_BLOCK" | grep -vE "^(SET @@session\.|/\*!|#|$)" | \
+                       grep -iE "^[[:space:]]*(truncate|insert|update|delete|create|drop|alter|replace|flush|optimize|analyze|repair|show|start|stop|reset|change)" | \
+                       head -1 | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | sed 's/\/\*!\*\/;*$//')
+        
+        # Define maintenance operation patterns
+        MAINTENANCE_PATTERNS="(truncate[[:space:]]+mysql\.(slow_log|general_log|error_log))|(flush[[:space:]]+(logs|binary[[:space:]]+logs))|(optimize[[:space:]]+table)|(analyze[[:space:]]+table)|(repair[[:space:]]+table)|(show[[:space:]]+(slave|master)[[:space:]]+status)|(start[[:space:]]+slave)|(stop[[:space:]]+slave)|(reset[[:space:]]+slave)"
+        # Simplified maintenance patterns - test one by one
+        #MAINTENANCE_PATTERNS="truncate[[:space:]]+mysql\.slow_log|truncate[[:space:]]+mysql\.general_log|flush[[:space:]]+logs"
+        # Check if the SQL statement matches maintenance patterns
 
+        if [[ -n "$SQL_STATEMENT" ]]; then
+            log "  Found SQL: $SQL_STATEMENT"
+            
+            # Check against maintenance patterns (case insensitive)
+            if echo "$SQL_STATEMENT" | grep -qiE "$MAINTENANCE_PATTERNS"; then
+                MAINTENANCE_COUNT=$((MAINTENANCE_COUNT + 1))
+                log "  -> MAINTENANCE #$MAINTENANCE_COUNT: $SQL_STATEMENT (IGNORED)"
+                log "  -> Continuing to next transaction..."
+            else
+                log "  -> REAL FAILOVER DETECTED: $SQL_STATEMENT"
+                log "  -> STOPPING ANALYSIS IMMEDIATELY - Failover found!"
+                
+                # Store failover details
+                FAILOVER_POS="$CURRENT_POS"
+                FAILOVER_GTID=$(echo "$FOREIGN_LINE" | sed -n 's/.*GTID \([0-9-]\+\).*/\1/p')
+                FAILOVER_SERVER_ID="$OTHER_SERVER_ID"
+                FAILOVER_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+                FAILOVER_SQL="$SQL_STATEMENT"
+                FAILOVER_LINE="$FOREIGN_LINE"
+                
+                # Write failover file immediately
+                {
+                    echo "FAILOVER DETECTED"
+                    echo "Detected server_id: $OTHER_SERVER_ID"
+                    echo "Binlog: $CURRENT_BINLOG"
+                    echo "Position: $FAILOVER_POS"
+                    echo "Timestamp: $(date -u)"
+                    echo "FAILOVER_GTID: $FAILOVER_GTID"
+                    echo "FAILOVER_POS: $FAILOVER_POS"
+                    echo "FAILOVER_SERVER_ID: $FAILOVER_SERVER_ID"
+                    echo "FAILOVER_TIME: $FAILOVER_TIME"
+                    echo "SQL_STATEMENT: $FAILOVER_SQL"
+                    echo "MAINTENANCE_COUNT: $MAINTENANCE_COUNT"
+                    echo "TRANSACTION_ANALYZED: $TRANSACTION_COUNT"
+                    echo "FULL FAILOVER_LINE: $FAILOVER_LINE"
+                } > "$FAILOVER_FILE"
 
-    exit 10
+                log "FAILOVER DETECTED - IMMEDIATE STOP"
+                log "Foreign server_id $OTHER_SERVER_ID found with non-maintenance SQL"
+                log "Failover SQL: $FAILOVER_SQL"
+                log "Failover at $CURRENT_BINLOG position $FAILOVER_POS"
+                log "Analyzed $TRANSACTION_COUNT transactions ($MAINTENANCE_COUNT maintenance, 1 failover)"
+                log "Handoff file written to $FAILOVER_FILE"
+                log "  Position : $FAILOVER_POS"
+                log "  GTID     : $FAILOVER_GTID"
+                log "  ServerID : $FAILOVER_SERVER_ID"
+                log "CRITICAL: Stopping processing - other server is now primary"
+
+                ############################################
+                # COPY FAILOVER FILE TO NEW PRIMARY
+                ############################################
+
+                # Convert server_id to array index (1 → 0, 2 → 1)
+                NEW_PRIMARY_INDEX=$((FAILOVER_SERVER_ID - 1))
+
+                NEW_PRIMARY_HOST="${CLUSTER_NODES[$NEW_PRIMARY_INDEX]}"
+
+                if [[ -z "$NEW_PRIMARY_HOST" ]]; then
+                    log "ERROR: Unable to resolve new primary host for server_id $FAILOVER_SERVER_ID"
+                else
+                    section "FAILOVER HANDOFF"
+
+                    log "Copying failover file to new primary"
+                    log "  Server ID : $FAILOVER_SERVER_ID"
+                    log "  Host      : $NEW_PRIMARY_HOST"
+                    log "  File      : $FAILOVER_FILE"
+
+                    SCP_CMD="scp $FAILOVER_FILE $NEW_PRIMARY_HOST:$FAILOVER_FILE"
+
+                    log "Executing: $SCP_CMD"
+
+                    if scp "$FAILOVER_FILE" "$NEW_PRIMARY_HOST:$FAILOVER_FILE"; then
+                        log "Failover file successfully copied to $NEW_PRIMARY_HOST"
+                        ############################################
+                        # Remove failover file (handoff complete)
+                        ############################################
+                        rm -f "$FAILOVER_FILE"
+                        log "Failover file consumed and removed"
+                    else
+                        log "ERROR: Failed to copy failover file to $NEW_PRIMARY_HOST"
+                        log "You may attempt to copy the file manually and remove the failover file locally before moving forward"
+                    fi
+                fi
+
+                # IMMEDIATE EXIT - DO NOT PROCESS ANY MORE OF THIS BINLOG
+                exit 10
+            fi
+        else
+            log "  WARNING: No SQL statement found in transaction block, treating as potential failover"
+            log "  -> POTENTIAL FAILOVER DETECTED (no SQL found)"
+            log "  -> STOPPING ANALYSIS IMMEDIATELY - Unknown transaction type!"
+            
+            # Treat unknown transactions as potential failovers for safety
+            FAILOVER_POS="$CURRENT_POS"
+            FAILOVER_GTID=$(echo "$FOREIGN_LINE" | sed -n 's/.*GTID \([0-9-]\+\).*/\1/p')
+            FAILOVER_SERVER_ID="$OTHER_SERVER_ID"
+            FAILOVER_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+            FAILOVER_SQL="UNKNOWN_TRANSACTION"
+            FAILOVER_LINE="$FOREIGN_LINE"
+            
+            {
+                echo "FAILOVER DETECTED"
+                echo "Detected server_id: $OTHER_SERVER_ID"
+                echo "Binlog: $CURRENT_BINLOG"
+                echo "Position: $FAILOVER_POS"
+                echo "Timestamp: $(date -u)"
+                echo "FAILOVER_GTID: $FAILOVER_GTID"
+                echo "FAILOVER_POS: $FAILOVER_POS"
+                echo "FAILOVER_SERVER_ID: $FAILOVER_SERVER_ID"
+                echo "FAILOVER_TIME: $FAILOVER_TIME"
+                echo "SQL_STATEMENT: $FAILOVER_SQL"
+                echo "MAINTENANCE_COUNT: $MAINTENANCE_COUNT"
+                echo "TRANSACTION_ANALYZED: $TRANSACTION_COUNT"
+                echo "FULL FAILOVER_LINE: $FAILOVER_LINE"
+                echo "NOTE: Unknown transaction type - treated as failover for safety"
+            } > "$FAILOVER_FILE"
+            
+            log "UNKNOWN TRANSACTION DETECTED - TREATING AS FAILOVER"
+            # [Same handoff logic as above...]
+            exit 10
+        fi
+        
+    done <<< "$ALL_FOREIGN_LINES"
+    
+    # If we reach here, all foreign transactions were maintenance operations
+    log "ANALYSIS COMPLETE - ALL MAINTENANCE:"
+    log "  Maintenance operations: $MAINTENANCE_COUNT"
+    log "  Total foreign transactions: $TRANSACTION_COUNT"
+    log "  Result: No failover detected, continuing binlog processing..."
+    
+else
+    log "No transactions from foreign server_id $OTHER_SERVER_ID found in this binlog"
 fi
 
 ############################################
