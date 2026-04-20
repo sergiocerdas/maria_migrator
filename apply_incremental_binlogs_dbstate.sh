@@ -6,7 +6,7 @@ set -euo pipefail
 ############################################
 
 if [[ $# -lt 1 ]]; then
-    echo "Usage: $0 <CONFIG_FILE> [binlog_name start_pos]"
+    echo "Usage: $0 <CONFIG_FILE>"
     exit 1
 fi
 
@@ -32,7 +32,8 @@ for _var in PORT BINLOG_DIR WORKDIR STATE_FILE LOG_FILE FAILOVER_FILE \
             MYSQL_BINLOG MYSQL \
             DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME \
             MIGRATION_NAME SOURCE_INSTANCE_NAME SOURCE_VIP_PORT \
-            SOURCE_CLUSTER_ID TARGET_INSTANCE_NAME; do
+            SOURCE_CLUSTER_ID TARGET_INSTANCE_NAME \
+            INITIAL_BINLOG INITIAL_POS; do
     if [[ -z "${!_var:-}" ]]; then
         echo "ERROR: Required config variable '$_var' is not set in $CONFIG_FILE"
         exit 1
@@ -47,12 +48,6 @@ fi
 
 if [[ "${SOURCE_CLUSTER_NODES[0]}" == "${SOURCE_CLUSTER_NODES[1]}" ]]; then
     echo "ERROR: SOURCE_CLUSTER_NODES entries are identical in $CONFIG_FILE"
-    exit 1
-fi
-
-# Validate SOURCE_CLUSTER_HOSTNAMES array
-if [[ ${#SOURCE_CLUSTER_HOSTNAMES[@]} -ne ${#SOURCE_CLUSTER_NODES[@]} ]]; then
-    echo "ERROR: SOURCE_CLUSTER_HOSTNAMES must have the same number of entries as SOURCE_CLUSTER_NODES in $CONFIG_FILE"
     exit 1
 fi
 
@@ -189,22 +184,62 @@ log "LOG_FILE=$LOG_FILE"
 section "DETERMINE SERVER ID"
 
 HOSTNAME_SHORT=$(hostname -s)
-#LOCAL_SERVER_ID="${HOSTNAME_SHORT:1:1}"
-LOCAL_SERVER_ID=$(mysql --host $HOSTNAME --user=mysql01 --port=$PORT --skip-column-names --silent -e "SELECT @@server_id;")
+log "Local hostname: $HOSTNAME_SHORT"
 
-log "Hostname detected: $HOSTNAME_SHORT"
-log "Inferred local server-id: $LOCAL_SERVER_ID"
+# Match local hostname against CLUSTER_NODES to find the local index
+LOCAL_NODE_INDEX=-1
+for _i in "${!CLUSTER_NODES[@]}"; do
+    if [[ "${CLUSTER_NODES[$_i]}" == "$HOSTNAME_SHORT" ]]; then
+        LOCAL_NODE_INDEX=$_i
+        break
+    fi
+done
 
-if [[ ! "$LOCAL_SERVER_ID" =~ ^[12]$ ]]; then
-    log "ERROR: Unable to infer valid server-id from hostname"
+if [[ "$LOCAL_NODE_INDEX" -lt 0 ]]; then
+    log "ERROR: Local hostname '$HOSTNAME_SHORT' not found in CLUSTER_NODES"
     exit 1
 fi
 
-#OTHER_SERVER_ID=$([[ "$LOCAL_SERVER_ID" == "1" ]] && echo 2 || echo 1)
-OTHER_SERVER_ID=$(mysql --host $CLUSTER_NODE_2 --user=mysql01 --port=$PORT --skip-column-names --silent -e "SELECT @@server_id;")
+log "Matched local node: ${CLUSTER_NODES[$LOCAL_NODE_INDEX]} (index=$LOCAL_NODE_INDEX)"
 
-log "Hostname: $HOSTNAME_SHORT"
+# Query local MySQL for this node's server_id
+LOCAL_SERVER_ID=$(mysql --host "$HOSTNAME_SHORT" --user=mysql01 --port="$PORT" \
+    --skip-column-names --silent -e "SELECT @@server_id;")
+
+if [[ -z "$LOCAL_SERVER_ID" ]]; then
+    log "ERROR: Could not retrieve server_id from local node '$HOSTNAME_SHORT'"
+    exit 1
+fi
 log "Local server_id: $LOCAL_SERVER_ID"
+
+# Query all other cluster nodes for their server_ids
+OTHER_SERVER_IDS=()
+for _i in "${!CLUSTER_NODES[@]}"; do
+    [[ "$_i" -eq "$LOCAL_NODE_INDEX" ]] && continue
+    _other_node="${CLUSTER_NODES[$_i]}"
+    _sid=$(mysql --host "$_other_node" --user=mysql01 --port="$PORT" \
+        --skip-column-names --silent -e "SELECT @@server_id;" 2>/dev/null || true)
+    if [[ -n "$_sid" ]]; then
+        OTHER_SERVER_IDS+=("$_sid")
+        log "Other node: $_other_node → server_id=$_sid"
+    else
+        log "WARNING: Could not retrieve server_id from node '$_other_node'"
+    fi
+done
+
+if [[ ${#OTHER_SERVER_IDS[@]} -eq 0 ]]; then
+    log "ERROR: Could not retrieve server_id from any other cluster node"
+    exit 1
+fi
+
+# Build a grep-compatible pattern: single value or alternation group for multiple nodes
+if [[ ${#OTHER_SERVER_IDS[@]} -eq 1 ]]; then
+    OTHER_SERVER_ID="${OTHER_SERVER_IDS[0]}"
+else
+    OTHER_SERVER_ID="($(IFS='|'; echo "${OTHER_SERVER_IDS[*]}"))"
+fi
+
+log "Other server_id pattern: $OTHER_SERVER_ID"
 
 ############################################
 # CLUSTER NODES CHECK
@@ -215,10 +250,9 @@ log "Checking/registering ${#SOURCE_CLUSTER_NODES[@]} cluster node(s) in cluster
 
 for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
     _node_name="${SOURCE_CLUSTER_NODES[$_idx]}"
-    _node_hostname="${SOURCE_CLUSTER_HOSTNAMES[$_idx]}"
     _node_ip="${SOURCE_CLUSTER_IPS[$_idx]:-}"
 
-    log "  Checking node: $_node_name (hostname=$_node_hostname, ip=${_node_ip:-NULL})"
+    log "  Checking node: $_node_name (ip=${_node_ip:-NULL})"
 
     _existing_node_id=$(db_query "SELECT node_id FROM cluster_nodes \
         WHERE node_name = '${_node_name//\'/\'\'}' LIMIT 1;" || true)
@@ -232,7 +266,7 @@ for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
         db_query "INSERT INTO cluster_nodes (node_name, server_hostname, server_ip) \
             VALUES ( \
                 '${_node_name//\'/\'\'}', \
-                '${_node_hostname//\'/\'\'}', \
+                '${_node_name//\'/\'\'}', \
                 $_node_ip_sql \
             );" \
             || { log "    ERROR: Failed to insert cluster node '$_node_name'"; exit 1; }
@@ -245,6 +279,8 @@ for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
 done
 
 log "Cluster nodes check complete"
+
+
 
 ############################################
 # MIGRATION CONFIG CHECK
@@ -357,6 +393,12 @@ fi
 log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
 
 ############################################
+# TEST RUN - EARLY EXIT
+############################################
+log "TEST RUN: Validation checkpoint reached — exiting early for review"
+exit 0
+
+############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
 ############################################
 section "FAILOVER RESUME CHECK"
@@ -446,16 +488,11 @@ section "STATE INITIALIZATION"
 if [[ ! -f "$STATE_FILE" ]]; then
     log "No state file found → FIRST RUN"
 
-    if [[ $# -ne 2 ]]; then
-        log "ERROR: First run requires <binlog_name> <start_position>"
-        exit 1
-    fi
+    CURRENT_BINLOG="$INITIAL_BINLOG"
+    CURRENT_POS="$INITIAL_POS"
 
-    CURRENT_BINLOG="$1"
-    CURRENT_POS="$2"
-
-    log "Initial binlog provided: $CURRENT_BINLOG"
-    log "Initial position provided: $CURRENT_POS"
+    log "Initial binlog from config: $CURRENT_BINLOG"
+    log "Initial position from config: $CURRENT_POS"
 else
     log "State file found → RESUMING"
     log "Loading state file: $STATE_FILE"
