@@ -30,7 +30,7 @@ source "$CONFIG_FILE"
 for _var in PORT BINLOG_DIR WORKDIR STATE_FILE LOG_FILE FAILOVER_FILE \
             TARGET_HOST TARGET_PORT TARGET_USER TARGET_PASS \
             MYSQL_BINLOG MYSQL \
-            DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME \
+            DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME DB_SSL\
             MIGRATION_NAME SOURCE_INSTANCE_NAME SOURCE_VIP_PORT \
             SOURCE_CLUSTER_ID TARGET_INSTANCE_NAME \
             INITIAL_BINLOG INITIAL_POS; do
@@ -57,6 +57,7 @@ CLUSTER_NODE_2="${CLUSTER_NODES[1]}"
 
 
 
+echo "CLUSTER_NODES: (${CLUSTER_NODES[*]})"
 
 
 ############################################
@@ -74,10 +75,25 @@ section() {
     log "========== $* =========="
 }
 
+############################################
+# DATABASE FUNCTIONS
+############################################
+
 # Low-level helper: execute a query against the control DB and return stdout
 db_query() {
-    mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" \
-          --skip-column-names --silent "$DB_NAME" -e "$1" 2>/dev/null
+    #log "   Query : $1 "
+    mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" --port="$DB_PORT" $DB_SSL "$DB_NAME" -e  "$1"
+}
+
+# db connection validation
+test_db_connection() {
+    if mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" --port="$DB_PORT" $DB_SSL "$DB_NAME" -e "SELECT 1;" >/dev/null 2>&1; then
+        echo "Database connection successful"
+        return 0
+    else
+        echo "Database connection failed"
+        return 1
+    fi
 }
 
 # Database logging function
@@ -128,7 +144,8 @@ db_log() {
     );"
 
     # Execute the SQL query
-    if ! mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" -e "$sql_query" 2>/dev/null; then
+    #if ! mysql -h "$DB_HOST" -P "$DB_PORT" -u "$DB_USER" -p"$DB_PASSWORD" "$DB_NAME" -e "$sql_query" 2>/dev/null; then
+    if ! mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" --port="$DB_PORT" $DB_SSL "$DB_NAME" -e "$sql_query" 2>/dev/null; then
         # If database logging fails, fall back to file logging
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] [DB_LOG_FAILED] [$log_level] $log_message" >> "$LOG_FILE"
     fi
@@ -154,9 +171,6 @@ db_log_error() {
 db_log_critical() {
     db_log "CRITICAL" "$1" "$2" "$3" "$4"
 }
-
-
-
 
 ############################################
 # LOG CLUSTER CONFIG
@@ -189,7 +203,11 @@ log "Local hostname: $HOSTNAME_SHORT"
 # Match local hostname against CLUSTER_NODES to find the local index
 LOCAL_NODE_INDEX=-1
 for _i in "${!CLUSTER_NODES[@]}"; do
+<<<<<<< HEAD
+    if [[ "${CLUSTER_NODES[$_i],,}" == "${HOSTNAME_SHORT,,}" ]]; then
+=======
     if [[ "${CLUSTER_NODES[$_i]}" == "$HOSTNAME_SHORT" ]]; then
+>>>>>>> origin/main
         LOCAL_NODE_INDEX=$_i
         break
     fi
@@ -269,8 +287,7 @@ for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
                 '${_node_name//\'/\'\'}', \
                 $_node_ip_sql \
             );" \
-            || { log "    ERROR: Failed to insert cluster node '$_node_name'"; exit 1; }
-
+            || { log "    ERROR: Failed to insert cluster node '$_node_name'";exit 1; }
         _existing_node_id=$(db_query "SELECT LAST_INSERT_ID();" || true)
         log "    Inserted → node_id=$_existing_node_id"
     else
@@ -805,3 +822,4 @@ rm -f "$SQL_FILE" "$ERR_FILE"
 ############################################
 section "SCRIPT END"
 log "Execution completed successfully"
+
