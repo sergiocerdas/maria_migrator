@@ -85,6 +85,13 @@ db_query() {
     mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" --port="$DB_PORT" $DB_SSL "$DB_NAME" -e  "$1"
 }
 
+# Scalar query helper: returns a single clean value with no column headers
+db_scalar() {
+    mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+          --port="$DB_PORT" $DB_SSL --skip-column-names --batch \
+          "$DB_NAME" -e "$1" 2>/dev/null || true
+}
+
 # db connection validation
 test_db_connection() {
     if mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" --port="$DB_PORT" $DB_SSL "$DB_NAME" -e "SELECT 1;" >/dev/null 2>&1; then
@@ -203,11 +210,7 @@ log "Local hostname: $HOSTNAME_SHORT"
 # Match local hostname against CLUSTER_NODES to find the local index
 LOCAL_NODE_INDEX=-1
 for _i in "${!CLUSTER_NODES[@]}"; do
-<<<<<<< HEAD
     if [[ "${CLUSTER_NODES[$_i],,}" == "${HOSTNAME_SHORT,,}" ]]; then
-=======
-    if [[ "${CLUSTER_NODES[$_i]}" == "$HOSTNAME_SHORT" ]]; then
->>>>>>> origin/main
         LOCAL_NODE_INDEX=$_i
         break
     fi
@@ -306,7 +309,7 @@ section "MIGRATION CONFIG CHECK"
 
 log "Checking migration_config for: $MIGRATION_NAME"
 
-CONFIG_ID=$(db_query "SELECT config_id FROM migration_config \
+CONFIG_ID=$(db_scalar "SELECT config_id FROM migration_config \
     WHERE migration_name = '${MIGRATION_NAME//\'/\'\'}' LIMIT 1;" || true)
 
 if [[ -z "$CONFIG_ID" ]]; then
@@ -399,7 +402,7 @@ fi
 # Resolve the current node's node_id from cluster_nodes
 LOCAL_NODE_NAME="${CLUSTER_NODES[$((LOCAL_SERVER_ID - 1))]}"
 
-CURRENT_NODE_ID=$(db_query "SELECT node_id FROM cluster_nodes \
+CURRENT_NODE_ID=$(db_scalar "SELECT node_id FROM cluster_nodes \
     WHERE node_name = '${LOCAL_NODE_NAME//\'/\'\'}' LIMIT 1;" || true)
 
 if [[ -z "$CURRENT_NODE_ID" ]]; then
@@ -407,13 +410,8 @@ if [[ -z "$CURRENT_NODE_ID" ]]; then
     CURRENT_NODE_ID=0
 fi
 
-log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
-
-############################################
-# TEST RUN - EARLY EXIT
-############################################
-log "TEST RUN: Validation checkpoint reached — exiting early for review"
-exit 0
+log "Using CONFIG_ID=$CONFIG_ID "
+log "CURRENT_NODE_ID=$CURRENT_NODE_ID"
 
 ############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
@@ -502,26 +500,74 @@ fi
 ############################################
 section "STATE INITIALIZATION"
 
-if [[ ! -f "$STATE_FILE" ]]; then
-    log "No state file found → FIRST RUN"
+# Check migration_status for existing state
+_status_binlog=$(db_scalar "SELECT current_binlog_file FROM migration_status \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+
+if [[ -z "$_status_binlog" ]]; then
+    log "No migration status found in DB → FIRST RUN"
 
     CURRENT_BINLOG="$INITIAL_BINLOG"
     CURRENT_POS="$INITIAL_POS"
 
-    log "Initial binlog from config: $CURRENT_BINLOG"
-    log "Initial position from config: $CURRENT_POS"
+    # Extract server name from binlog filename: binlogs_<servername>.<sequence>
+    _binlog_server=$(echo "$CURRENT_BINLOG" | sed -n 's/^[^_]*_\([^.]*\)\..*/\1/p')
+
+    if [[ -z "$_binlog_server" ]]; then
+        log "ERROR: Could not extract server name from binlog '$CURRENT_BINLOG'"
+        log "Expected format: binlogs_<servername>.<sequence>  (e.g. binlogs_d1fm1mar043.000001)"
+        exit 1
+    fi
+
+    log "Server name extracted from initial binlog: $_binlog_server"
+
+    CURRENT_PROCESSING_NODE_ID=$(db_scalar "SELECT node_id FROM cluster_nodes \
+        WHERE LOWER(node_name) = LOWER('${_binlog_server//\'/\'\'}') LIMIT 1;")
+
+    if [[ -z "$CURRENT_PROCESSING_NODE_ID" ]]; then
+        log "ERROR: No cluster_nodes entry found for server name '$_binlog_server'"
+        exit 1
+    fi
+    
+    _processing_server_id=$(db_scalar "SELECT server_id FROM source_cluster_mapping \
+        WHERE config_id = $CONFIG_ID AND node_id = $CURRENT_PROCESSING_NODE_ID LIMIT 1;")
+
+    log "Initial binlog            : $CURRENT_BINLOG"
+    log "Initial position          : $CURRENT_POS"
+    log "Processing node_id        : $CURRENT_PROCESSING_NODE_ID"
+    log "Processing server_id      : ${_processing_server_id:-unknown}"
+
+    db_query "INSERT INTO migration_status \
+        (config_id, current_processing_node_id, current_processing_server_id, \
+         current_binlog_file, current_binlog_position, processing_status, \
+         process_pid, process_hostname, process_start_time) \
+        VALUES ($CONFIG_ID, $CURRENT_PROCESSING_NODE_ID, \
+            ${_processing_server_id:-0}, \
+            '${CURRENT_BINLOG//\'/\'\'}', $CURRENT_POS, \
+            'RUNNING', $$, '$(hostname -s)', NOW());" \
+        || { log "ERROR: Failed to create migration_status record"; exit 1; }
+
+    log "Migration status record created in DB"
 else
-    log "State file found → RESUMING"
-    log "Loading state file: $STATE_FILE"
+    log "Migration status found in DB → RESUMING"
 
-    # shellcheck disable=SC1090
-    source "$STATE_FILE"
+    CURRENT_BINLOG="$_status_binlog"
+    CURRENT_POS=$(db_scalar "SELECT current_binlog_position FROM migration_status \
+        WHERE config_id = $CONFIG_ID LIMIT 1;")
+    CURRENT_PROCESSING_NODE_ID=$(db_scalar "SELECT current_processing_node_id FROM migration_status \
+        WHERE config_id = $CONFIG_ID LIMIT 1;")
 
-    CURRENT_BINLOG="$LAST_BINLOG"
-    CURRENT_POS="$LAST_POS"
+    log "Resuming from binlog      : $CURRENT_BINLOG"
+    log "Resuming from position    : $CURRENT_POS"
+    log "Processing node_id        : $CURRENT_PROCESSING_NODE_ID"
 
-    log "Resuming from binlog: $CURRENT_BINLOG"
-    log "Resuming from position: $CURRENT_POS"
+    db_query "UPDATE migration_status SET \
+        processing_status = 'RUNNING', \
+        process_pid = $$, \
+        process_hostname = '$(hostname -s)', \
+        process_start_time = NOW() \
+        WHERE config_id = $CONFIG_ID;" \
+        || log "WARNING: Failed to update migration_status to RUNNING"
 fi
 
 BINLOG_PATH="$BINLOG_DIR/$CURRENT_BINLOG"
@@ -531,6 +577,13 @@ ERR_FILE="$WORKDIR/$CURRENT_BINLOG.err"
 log "BINLOG_PATH=$BINLOG_PATH"
 log "SQL_FILE=$SQL_FILE"
 log "ERR_FILE=$ERR_FILE"
+
+############################################
+# TEST RUN - EARLY EXIT
+############################################
+log "TEST RUN: Validation checkpoint reached — exiting early for review"
+exit 0
+
 
 ############################################
 # BINLOG EXISTENCE CHECK
