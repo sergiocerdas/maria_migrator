@@ -203,6 +203,22 @@ DETERMINISTIC
 BEGIN
     RETURN AES_DECRYPT(encrypted_password, encryption_key);
 END//
+
+-- Truncates all tables in dependency-safe order (child tables first)
+CREATE PROCEDURE reset_all_data()
+BEGIN
+    SET FOREIGN_KEY_CHECKS = 0;
+
+    TRUNCATE TABLE processing_log;
+    TRUNCATE TABLE failover_events;
+    TRUNCATE TABLE migration_status;
+    TRUNCATE TABLE source_cluster_mapping;
+    TRUNCATE TABLE migration_config;
+    TRUNCATE TABLE cluster_nodes;
+
+    SET FOREIGN_KEY_CHECKS = 1;
+END//
+
 DELIMITER ;
 
 
