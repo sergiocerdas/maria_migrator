@@ -275,7 +275,7 @@ for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
 
     log "  Checking node: $_node_name (ip=${_node_ip:-NULL})"
 
-    _existing_node_id=$(db_query "SELECT node_id FROM cluster_nodes \
+    _existing_node_id=$(db_scalar "SELECT node_id FROM cluster_nodes \
         WHERE node_name = '${_node_name//\'/\'\'}' LIMIT 1;" || true)
 
     if [[ -z "$_existing_node_id" ]]; then
@@ -291,7 +291,7 @@ for _idx in "${!SOURCE_CLUSTER_NODES[@]}"; do
                 $_node_ip_sql \
             );" \
             || { log "    ERROR: Failed to insert cluster node '$_node_name'";exit 1; }
-        _existing_node_id=$(db_query "SELECT LAST_INSERT_ID();" || true)
+        _existing_node_id=$(db_scalar "SELECT LAST_INSERT_ID();" || true)
         log "    Inserted → node_id=$_existing_node_id"
     else
         log "    Already exists → node_id=$_existing_node_id (skipping)"
@@ -341,7 +341,7 @@ if [[ -z "$CONFIG_ID" ]]; then
         '${TARGET_PASS//\'/\'\'}'
     );" || { log "ERROR: Failed to insert migration_config record"; exit 1; }
 
-    CONFIG_ID=$(db_query "SELECT LAST_INSERT_ID();" || true)
+    CONFIG_ID=$(db_scalar "SELECT LAST_INSERT_ID();" || true)
 
     if [[ -z "$CONFIG_ID" || "$CONFIG_ID" == "0" ]]; then
         log "ERROR: INSERT succeeded but could not retrieve config_id"
@@ -374,7 +374,7 @@ if [[ -z "$CONFIG_ID" ]]; then
         log "    server_id=$_node_server_id"
 
         # Resolve node_id from cluster_nodes
-        _node_id=$(db_query "SELECT node_id FROM cluster_nodes \
+        _node_id=$(db_scalar "SELECT node_id FROM cluster_nodes \
             WHERE node_name = '${_node_name//\'/\'\'}' LIMIT 1;" || true)
 
         if [[ -z "$_node_id" ]]; then
