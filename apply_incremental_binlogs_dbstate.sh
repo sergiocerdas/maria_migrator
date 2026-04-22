@@ -410,8 +410,7 @@ if [[ -z "$CURRENT_NODE_ID" ]]; then
     CURRENT_NODE_ID=0
 fi
 
-log "Using CONFIG_ID=$CONFIG_ID "
-log "CURRENT_NODE_ID=$CURRENT_NODE_ID"
+log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
 
 ############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
@@ -528,7 +527,10 @@ if [[ -z "$_status_binlog" ]]; then
         log "ERROR: No cluster_nodes entry found for server name '$_binlog_server'"
         exit 1
     fi
-    
+
+    log "Config ID: $CONFIG_ID"
+    log "Current Processing Node ID: $CURRENT_PROCESSING_NODE_ID"
+
     _processing_server_id=$(db_scalar "SELECT server_id FROM source_cluster_mapping \
         WHERE config_id = $CONFIG_ID AND node_id = $CURRENT_PROCESSING_NODE_ID LIMIT 1;")
 
@@ -875,4 +877,5 @@ rm -f "$SQL_FILE" "$ERR_FILE"
 ############################################
 section "SCRIPT END"
 log "Execution completed successfully"
+
 
