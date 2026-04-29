@@ -84,7 +84,9 @@ CREATE TABLE migration_status (
     current_gtid_position VARCHAR(500),
     
     -- Processing State
-    processing_status ENUM('RUNNING', 'PAUSED', 'STOPPED', 'ERROR', 'FAILOVER_DETECTED') DEFAULT 'STOPPED',
+    processing_status ENUM('RUNNING','PAUSED','STOPPED','ERROR','FAILOVER_DETECTED','FAILOVER_HANDOFF') DEFAULT 'STOPPED',
+
+
     last_processed_timestamp TIMESTAMP NULL,
     last_heartbeat TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     

@@ -27,7 +27,7 @@ fi
 source "$CONFIG_FILE"
 
 # Validate all required scalar variables are present in the config file
-for _var in PORT BINLOG_DIR WORKDIR STATE_FILE LOG_FILE FAILOVER_FILE \
+for _var in PORT BINLOG_DIR WORKDIR LOG_FILE \
             TARGET_HOST TARGET_PORT TARGET_USER TARGET_PASS \
             MYSQL_BINLOG MYSQL \
             DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME DB_SSL\
@@ -73,6 +73,59 @@ log() {
 section() {
     log ""
     log "========== $* =========="
+}
+
+filter_sql_by_gtids() {
+    local input_file="$1"
+    local gtids_file="$2"
+    local output_file="$3"
+    local filtered_out_file="$4"
+
+    : > "$output_file"
+    : > "$filtered_out_file"
+
+    awk -v keep_file="$output_file" -v drop_file="$filtered_out_file" '
+        NR == FNR {
+            if ($1 != "") {
+                drop_gtid[$1] = 1
+            }
+            next
+        }
+
+        function flush_block(target_file) {
+            if (!have_block) {
+                return
+            }
+
+            target_file = (current_gtid in drop_gtid) ? drop_file : keep_file
+            printf "%s", block_text >> target_file
+            block_text = ""
+            current_gtid = ""
+            have_block = 0
+        }
+
+        /^#.* GTID [0-9]-[0-9]-[0-9]/ {
+            flush_block()
+            current_gtid = $0
+            sub(/^.* GTID /, "", current_gtid)
+            sub(/[[:space:]].*$/, "", current_gtid)
+            block_text = $0 ORS
+            have_block = 1
+            next
+        }
+
+        {
+            if (have_block) {
+                block_text = block_text $0 ORS
+            } else {
+                print >> keep_file
+            }
+        }
+
+        END {
+            flush_block()
+        }
+    ' "$gtids_file" "$input_file"
 }
 
 ############################################
@@ -196,7 +249,6 @@ log "Local host: $(hostname)"
 section "SCRIPT START"
 log "PID=$$"
 log "WORKDIR=$WORKDIR"
-log "STATE_FILE=$STATE_FILE"
 log "LOG_FILE=$LOG_FILE"
 
 ############################################
@@ -419,19 +471,45 @@ log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
 ############################################
 section "FAILOVER RESUME CHECK"
 
-if [[ -f "$FAILOVER_FILE" ]]; then
-    log "Failover file detected: $FAILOVER_FILE"
-    log "Attempting GTID-based resume"
+FAILOVER_STATUS=$(db_scalar "SELECT processing_status FROM migration_status \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
 
-    FAILOVER_GTID=$(grep -oE 'FAILOVER_GTID[:=][[:space:]]*[0-9-]+' "$FAILOVER_FILE" \
-        | sed -E 's/.*[:=][[:space:]]*//')
+if [[ "$FAILOVER_STATUS" == "FAILOVER_HANDOFF" ]]; then
+    log "Failover handoff detected in migration_status"
 
-    if [[ -z "$FAILOVER_GTID" ]]; then
-        log "ERROR: Could not extract FAILOVER_GTID from file"
+    HANDOFF_NODE_ID=$(db_scalar "SELECT current_processing_node_id FROM migration_status \
+        WHERE config_id = $CONFIG_ID LIMIT 1;")
+    HANDOFF_SERVER_ID=$(db_scalar "SELECT current_processing_server_id FROM migration_status \
+        WHERE config_id = $CONFIG_ID LIMIT 1;")
+
+    if [[ -z "$HANDOFF_NODE_ID" || -z "$HANDOFF_SERVER_ID" ]]; then
+        log "ERROR: FAILOVER_HANDOFF is set but current processing node/server are missing in migration_status"
         exit 1
     fi
 
-    log "Failover GTID found: $FAILOVER_GTID"
+    if [[ "$HANDOFF_NODE_ID" != "$CURRENT_NODE_ID" ]]; then
+        log "This node is not the designated new primary (db_node_id=$HANDOFF_NODE_ID, local_node_id=$CURRENT_NODE_ID)"
+        log "Failover handoff belongs to another node — exiting"
+        exit 0
+    fi
+
+    FAILOVER_EVENT_ID=$(db_scalar "SELECT failover_id FROM failover_events \
+        WHERE config_id = $CONFIG_ID \
+          AND new_primary_node_id = $CURRENT_NODE_ID \
+          AND new_primary_server_id = $HANDOFF_SERVER_ID \
+        ORDER BY failover_id DESC LIMIT 1;")
+    FAILOVER_GTID=$(db_scalar "SELECT resume_from_gtid FROM failover_events \
+        WHERE config_id = $CONFIG_ID \
+          AND new_primary_node_id = $CURRENT_NODE_ID \
+          AND new_primary_server_id = $HANDOFF_SERVER_ID \
+        ORDER BY failover_id DESC LIMIT 1;")
+
+    if [[ -z "$FAILOVER_EVENT_ID" || -z "$FAILOVER_GTID" ]]; then
+        log "ERROR: Could not resolve failover resume GTID from failover_events for this new primary"
+        exit 1
+    fi
+
+    log "Failover event resolved: failover_id=$FAILOVER_EVENT_ID resume_gtid=$FAILOVER_GTID"
     log "Searching local binlogs for GTID..."
 
     FOUND_LINE=""
@@ -455,10 +533,6 @@ if [[ -f "$FAILOVER_FILE" ]]; then
     log "GTID located:"
     log "$FOUND_LINE"
 
-    ############################################
-    # Extract binlog file and end_log_pos
-    ############################################
-
     # File is before first colon
     CURRENT_BINLOG=$(echo "$FOUND_LINE" | cut -d':' -f1 | xargs basename)
 
@@ -468,30 +542,25 @@ if [[ -f "$FAILOVER_FILE" ]]; then
         | awk '{print $2}')
 
     if [[ -z "$CURRENT_BINLOG" || -z "$CURRENT_POS" ]]; then
-        log "ERROR: Failed to extract binlog name or position"
+        log "ERROR: Failed to extract resume binlog name or position from local binlogs"
         exit 1
     fi
 
-    log "Resume binlog determined:"
+    log "Resume binlog determined from control DB handoff:"
     log "  Binlog   : $CURRENT_BINLOG"
     log "  Position : $CURRENT_POS"
 
-    ############################################
-    # Persist new state
-    ############################################
-    cat > "$STATE_FILE" <<EOF
-LAST_BINLOG=$CURRENT_BINLOG
-LAST_POS=$CURRENT_POS
-EOF
+    db_query "UPDATE migration_status SET \
+        current_binlog_file = '${CURRENT_BINLOG//\'/\'\'}', \
+        current_binlog_position = $CURRENT_POS, \
+        current_gtid_position = '${FAILOVER_GTID//\'/\'\'}', \
+        last_processed_timestamp = NOW() \
+        WHERE config_id = $CONFIG_ID;" \
+        || { log "ERROR: Failed to persist failover resume location to migration_status"; exit 1; }
 
-    log "State updated based on failover:"
-    log "$(cat "$STATE_FILE")"
-
-    ############################################
-    # Remove failover file (handoff complete)
-    ############################################
-    rm -f "$FAILOVER_FILE"
-    log "Failover file consumed and removed"
+    db_log_info \
+        "New primary resumed from failover handoff: failover_id=$FAILOVER_EVENT_ID gtid=$FAILOVER_GTID resolved to $CURRENT_BINLOG:$CURRENT_POS" \
+        "$CURRENT_BINLOG" "$CURRENT_POS" "$FAILOVER_GTID"
 fi
 
 
@@ -535,18 +604,19 @@ if [[ -z "$_status_binlog" ]]; then
 
     _processing_server_id=$(db_scalar "SELECT server_id FROM source_cluster_mapping \
         WHERE config_id = $CONFIG_ID AND node_id = $CURRENT_PROCESSING_NODE_ID LIMIT 1;")
+    CURRENT_PROCESSING_SERVER_ID="${_processing_server_id:-0}"
 
     log "Initial binlog            : $CURRENT_BINLOG"
     log "Initial position          : $CURRENT_POS"
     log "Processing node_id        : $CURRENT_PROCESSING_NODE_ID"
-    log "Processing server_id      : ${_processing_server_id:-unknown}"
+    log "Processing server_id      : ${CURRENT_PROCESSING_SERVER_ID:-unknown}"
 
     db_query "INSERT INTO migration_status \
         (config_id, current_processing_node_id, current_processing_server_id, \
          current_binlog_file, current_binlog_position, processing_status, \
          process_pid, process_hostname, process_start_time) \
         VALUES ($CONFIG_ID, $CURRENT_PROCESSING_NODE_ID, \
-            ${_processing_server_id:-0}, \
+            ${CURRENT_PROCESSING_SERVER_ID:-0}, \
             '${CURRENT_BINLOG//\'/\'\'}', $CURRENT_POS, \
             'RUNNING', $$, '$(hostname -s)', NOW());" \
         || { log "ERROR: Failed to create migration_status record"; exit 1; }
@@ -560,10 +630,13 @@ else
         WHERE config_id = $CONFIG_ID LIMIT 1;")
     CURRENT_PROCESSING_NODE_ID=$(db_scalar "SELECT current_processing_node_id FROM migration_status \
         WHERE config_id = $CONFIG_ID LIMIT 1;")
+    CURRENT_PROCESSING_SERVER_ID=$(db_scalar "SELECT current_processing_server_id FROM migration_status \
+        WHERE config_id = $CONFIG_ID LIMIT 1;")
 
     log "Resuming from binlog      : $CURRENT_BINLOG"
     log "Resuming from position    : $CURRENT_POS"
     log "Processing node_id        : $CURRENT_PROCESSING_NODE_ID"
+    log "Processing server_id      : ${CURRENT_PROCESSING_SERVER_ID:-unknown}"
 
     db_query "UPDATE migration_status SET \
         processing_status = 'RUNNING', \
@@ -572,6 +645,17 @@ else
         process_start_time = NOW() \
         WHERE config_id = $CONFIG_ID;" \
         || log "WARNING: Failed to update migration_status to RUNNING"
+fi
+
+if [[ -z "${CURRENT_PROCESSING_SERVER_ID:-}" ]]; then
+    log "ERROR: current_processing_server_id is not set in migration_status"
+    exit 1
+fi
+
+if [[ "$LOCAL_SERVER_ID" != "$CURRENT_PROCESSING_SERVER_ID" ]]; then
+    log "This node is not the current processing server (local_server_id=$LOCAL_SERVER_ID, current_processing_server_id=$CURRENT_PROCESSING_SERVER_ID)"
+    db_log_info "Skipping iteration on non-processing server: local_server_id=$LOCAL_SERVER_ID current_processing_server_id=$CURRENT_PROCESSING_SERVER_ID" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    exit 0
 fi
 
 BINLOG_PATH="$BINLOG_DIR/$CURRENT_BINLOG"
@@ -615,14 +699,13 @@ db_log_info "Extracting binlog contents: $CURRENT_BINLOG (start_pos=$CURRENT_POS
 ############################################
 section "BINLOG IN-USE CHECK"
 
+BINLOG_IN_USE=0
 if grep -q "not closed properly" "$SQL_FILE"; then
+    BINLOG_IN_USE=1
     log "WARNING detected in binlog extraction:"
     log "[Not closed properly] line found in $SQL_FILE"
-    log "Binlog still in use → skipping this iteration safely"
-    db_log_warn "Binlog still in use (not closed properly), skipping iteration: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
-    rm -f "$SQL_FILE" "$ERR_FILE"
-    log "$SQL_FILE and $ERR_FILE files deleted"
-    exit 0
+    log "Binlog still in use — running failover detection only; apply/state advance will be skipped unless failover handoff is triggered"
+    db_log_warn "Binlog still in use (not closed properly): running failover detection only for $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
 fi
 
 ############################################
@@ -630,17 +713,17 @@ fi
 ############################################
 section "FAILOVER DETECTION"
 
-# Find ALL lines from any foreign server_id (pattern covers all non-local nodes)
-ALL_FOREIGN_LINES=$(grep -n -E "server id $OTHER_SERVER_ID" "$SQL_FILE" || true)
+# Find foreign GTID header lines only (one line per foreign transaction start)
+ALL_FOREIGN_LINES=$(grep -n -E "server id $OTHER_SERVER_ID.*GTID [0-9]-[0-9]-[0-9]" "$SQL_FILE" || true)
 
 if [[ -n "$ALL_FOREIGN_LINES" ]]; then
-    log "Found $(echo "$ALL_FOREIGN_LINES" | wc -l | tr -d ' ') foreign transaction(s) to analyze"
+    log "Found $(echo "$ALL_FOREIGN_LINES" | wc -l | tr -d ' ') foreign GTID transaction(s) to analyze"
 
     MAINTENANCE_COUNT=0
     TRANSACTION_COUNT=0
     FAILOVER_DETECTED=0
-    FOREIGN_RANGES_FILE="$WORKDIR/$CURRENT_BINLOG.foreign_ranges.txt"
-    : > "$FOREIGN_RANGES_FILE"
+    MAINTENANCE_GTIDS_FILE="$WORKDIR/$CURRENT_BINLOG.maintenance_gtids.txt"
+    : > "$MAINTENANCE_GTIDS_FILE"
 
     # Save the extraction start position before the loop overwrites CURRENT_POS
     BINLOG_START_POS="$CURRENT_POS"
@@ -665,24 +748,38 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
 
         log "Analyzing transaction #$TRANSACTION_COUNT at line $FOREIGN_LINE_NUM (server_id=$ACTUAL_FOREIGN_SERVER_ID, end_log_pos=$CURRENT_POS)..."
 
-        # Find the next GTID line to bound this transaction block
-        NEXT_GTID_LINE_NUM=$(sed -n "${FOREIGN_LINE_NUM},\$p" "$SQL_FILE" | grep -n "GTID [0-9]-[0-9]-[0-9]" | sed -n '2p' | cut -d: -f1)
+        # Find the next GTID line to bound this transaction block.
+        # Use awk so "no next GTID found" is an empty result, not a shell-fatal pipeline status.
+        NEXT_GTID_LINE_NUM=$(awk -v start_line="$((FOREIGN_LINE_NUM + 1))" '
+            NR < start_line { next }
+            /GTID [0-9]-[0-9]-[0-9]/ {
+                print NR - start_line + 1
+                exit
+            }
+        ' "$SQL_FILE")
 
         if [[ -n "$NEXT_GTID_LINE_NUM" ]]; then
-            TXN_END_LINE_NUM=$(( FOREIGN_LINE_NUM + NEXT_GTID_LINE_NUM - 2 ))
+            TXN_END_LINE_NUM=$(( FOREIGN_LINE_NUM + NEXT_GTID_LINE_NUM - 1 ))
             log "  Transaction ends at line $TXN_END_LINE_NUM (next GTID found)"
         else
             TXN_END_LINE_NUM=$(wc -l < "$SQL_FILE")
             log "  Transaction ends at EOF (line $TXN_END_LINE_NUM)"
         fi
 
-        # Extract the complete transaction block
-        TRANSACTION_BLOCK=$(sed -n "${FOREIGN_LINE_NUM},${TXN_END_LINE_NUM}p" "$SQL_FILE")
-
-        # Look for the first meaningful SQL statement in the block
-        SQL_STATEMENT=$(echo "$TRANSACTION_BLOCK" | grep -vE "^(SET @@session\.|/\*!|#|$)" | \
-                       grep -iE "^[[:space:]]*(truncate|insert|update|delete|create|drop|alter|replace|flush|optimize|analyze|repair|show|start|stop|reset|change)" | \
-                       head -1 | sed 's/^[[:space:]]*//' | sed 's/[[:space:]]*$//' | sed 's/\/\*!\*\/;*$//')
+        # Look for the first meaningful SQL statement in the block.
+        # Read directly from the file slice to avoid large shell variables and pipeline exit-code issues.
+        SQL_STATEMENT=$(awk -v start_line="$FOREIGN_LINE_NUM" -v end_line="$TXN_END_LINE_NUM" '
+            NR < start_line || NR > end_line { next }
+            /^(SET @@session\.|\/\*!|#|$)/ { next }
+            /^[[:space:]]*(truncate|insert|update|delete|create|drop|alter|replace|flush|optimize|analyze|repair|show|start|stop|reset|change)/ {
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                sub(/[[:space:]]+$/, "", line)
+                sub(/\/\*!\*\/;*$/, "", line)
+                print line
+                exit
+            }
+        ' "$SQL_FILE")
 
         # Patterns that are routine cluster maintenance — safe to ignore regardless of which node emits them
         MAINTENANCE_PATTERNS="(truncate[[:space:]]+mysql\.(slow_log|general_log|error_log))|(flush[[:space:]]+(logs|binary[[:space:]]+logs))|(optimize[[:space:]]+table)|(analyze[[:space:]]+table)|(repair[[:space:]]+table)|(show[[:space:]]+(slave|master)[[:space:]]+status)|(start[[:space:]]+slave)|(stop[[:space:]]+slave)|(reset[[:space:]]+slave)"
@@ -692,8 +789,11 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
 
             if echo "$SQL_STATEMENT" | grep -qE "$MAINTENANCE_PATTERNS"; then
                 MAINTENANCE_COUNT=$((MAINTENANCE_COUNT + 1))
+                MAINTENANCE_GTID=$(echo "$FOREIGN_LINE" | sed -n 's/.*GTID \([0-9-]\+\).*/\1/p')
                 log "  -> MAINTENANCE #$MAINTENANCE_COUNT (server_id=$ACTUAL_FOREIGN_SERVER_ID): $SQL_STATEMENT (IGNORED)"
-                echo "$FOREIGN_LINE_NUM $TXN_END_LINE_NUM" >> "$FOREIGN_RANGES_FILE"
+                if [[ -n "$MAINTENANCE_GTID" ]]; then
+                    echo "$MAINTENANCE_GTID" >> "$MAINTENANCE_GTIDS_FILE"
+                fi
             else
                 log "  -> REAL FAILOVER DETECTED (server_id=$ACTUAL_FOREIGN_SERVER_ID): $SQL_STATEMENT"
                 FAILOVER_DETECTED=1
@@ -757,28 +857,12 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             "$BINLOG_PATH" > "$PRE_FAILOVER_SQL" 2>/dev/null || true
 
         # Remove foreign maintenance transactions from pre-failover SQL before apply
-        if [[ -s "$PRE_FAILOVER_SQL" && -s "$FOREIGN_RANGES_FILE" ]]; then
+        if [[ -s "$PRE_FAILOVER_SQL" && -s "$MAINTENANCE_GTIDS_FILE" ]]; then
             PRE_FAILOVER_FILTERED_SQL="$WORKDIR/$CURRENT_BINLOG.prefailover.filtered.sql"
+            PRE_FAILOVER_FILTERED_OUT="$WORKDIR/$CURRENT_BINLOG.prefailover.filtered_out.sql"
 
-            awk '
-                NR == FNR {
-                    range_start[++range_count] = $1
-                    range_end[range_count] = $2
-                    next
-                }
-                {
-                    drop_line = 0
-                    for (i = 1; i <= range_count; i++) {
-                        if (NR >= range_start[i] && NR <= range_end[i]) {
-                            drop_line = 1
-                            break
-                        }
-                    }
-                    if (!drop_line) {
-                        print
-                    }
-                }
-            ' "$FOREIGN_RANGES_FILE" "$PRE_FAILOVER_SQL" > "$PRE_FAILOVER_FILTERED_SQL"
+            filter_sql_by_gtids "$PRE_FAILOVER_SQL" "$MAINTENANCE_GTIDS_FILE" "$PRE_FAILOVER_FILTERED_SQL" "$PRE_FAILOVER_FILTERED_OUT"
+            log "DEBUG: Pre-failover filtered-out transactions saved to: $PRE_FAILOVER_FILTERED_OUT"
 
             mv "$PRE_FAILOVER_FILTERED_SQL" "$PRE_FAILOVER_SQL"
         fi
@@ -890,41 +974,27 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             "$CURRENT_BINLOG" "$FAILOVER_POS" "$FAILOVER_GTID"
 
         log "Database updated — new primary will resume processing on next iteration"
-        rm -f "$FOREIGN_RANGES_FILE"
+        rm -f "$MAINTENANCE_GTIDS_FILE"
 
         # This node is no longer the active processor — exit immediately
         exit 10
 
     else
-        if [[ -s "$FOREIGN_RANGES_FILE" ]]; then
+        if [[ -s "$MAINTENANCE_GTIDS_FILE" ]]; then
             FILTERED_SQL_FILE="$WORKDIR/$CURRENT_BINLOG.filtered.sql"
-            REMOVED_LINES=$(awk '{sum += ($2 - $1 + 1)} END {print sum+0}' "$FOREIGN_RANGES_FILE")
+            FILTERED_OUT_FILE="$WORKDIR/$CURRENT_BINLOG.filtered_out.sql"
 
-            awk '
-                NR == FNR {
-                    range_start[++range_count] = $1
-                    range_end[range_count] = $2
-                    next
-                }
-                {
-                    drop_line = 0
-                    for (i = 1; i <= range_count; i++) {
-                        if (NR >= range_start[i] && NR <= range_end[i]) {
-                            drop_line = 1
-                            break
-                        }
-                    }
-                    if (!drop_line) {
-                        print
-                    }
-                }
-            ' "$FOREIGN_RANGES_FILE" "$SQL_FILE" > "$FILTERED_SQL_FILE"
+            filter_sql_by_gtids "$SQL_FILE" "$MAINTENANCE_GTIDS_FILE" "$FILTERED_SQL_FILE" "$FILTERED_OUT_FILE"
+
+            REMOVED_LINES=$(wc -l < "$FILTERED_OUT_FILE" | tr -d ' ')
+
+            log "DEBUG: Filtered-out transactions saved to: $FILTERED_OUT_FILE"
 
             mv "$FILTERED_SQL_FILE" "$SQL_FILE"
             log "Removed $TRANSACTION_COUNT foreign maintenance transaction block(s) from SQL file ($REMOVED_LINES line(s) removed)"
         fi
 
-        rm -f "$FOREIGN_RANGES_FILE"
+        rm -f "$MAINTENANCE_GTIDS_FILE"
 
         log "ANALYSIS COMPLETE - ALL FOREIGN TRANSACTIONS WERE MAINTENANCE:"
         log "  Maintenance operations : $MAINTENANCE_COUNT"
@@ -936,16 +1006,40 @@ else
     log "No foreign server_id transactions found in this binlog"
 fi
 
+
 ############################################
-# TEST RUN - EARLY EXIT
+# PRE-APPLY SQL VALIDATION
 ############################################
-log "TEST RUN: Validation checkpoint reached — exiting early for review"
-exit 0
+section "PRE-APPLY SQL VALIDATION"
+
+if [[ -s "$SQL_FILE" ]]; then
+    BINLOG_OPEN_COUNT=$(grep -c "^BINLOG '" "$SQL_FILE" || true)
+    BINLOG_CLOSE_COUNT=$(grep -c "^'/\\*!\\*/;$" "$SQL_FILE" || true)
+
+    if [[ "$BINLOG_OPEN_COUNT" != "$BINLOG_CLOSE_COUNT" ]]; then
+        log "ERROR: Filtered SQL appears malformed: BINLOG open/close count mismatch (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)"
+        db_log_error "Malformed filtered SQL detected before apply: BINLOG open/close mismatch for $CURRENT_BINLOG (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+        log "Keeping generated SQL artifacts for inspection: $SQL_FILE"
+        exit 1
+    fi
+fi
+
+
 
 ############################################
 # APPLY BINLOG TO TARGET
 ############################################
 section "APPLY BINLOG TO TARGET"
+
+if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
+    log "Binlog is still in use and no failover handoff was triggered — skipping apply and state advancement safely"
+    db_log_warn "Skipped apply/state advancement because binlog is still open: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    rm -f "$SQL_FILE" "$ERR_FILE"
+    log "$SQL_FILE and $ERR_FILE files deleted"
+    section "SCRIPT END"
+    log "Execution completed safely (binlog-in-use guard)"
+    exit 0
+fi
 
 if [[ -s "$SQL_FILE" ]]; then
     APPLY_CMD=(
@@ -958,6 +1052,7 @@ if [[ -s "$SQL_FILE" ]]; then
     )
 
     log "Applying SQL file to target"
+    db_log_info "Applying binlog contents to target: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
     log "Command:"
     log "${APPLY_CMD[*]} < $SQL_FILE"
 
@@ -975,16 +1070,21 @@ section "STATE ADVANCEMENT"
 NEXT_BINLOG=$(printf "%s.%06d" \
     "${CURRENT_BINLOG%.*}" \
     "$((10#${CURRENT_BINLOG##*.} + 1))")
+NEXT_POS=4
 
 log "Next binlog inferred: $NEXT_BINLOG"
+log "Next position inferred: $NEXT_POS"
 
-cat > "$STATE_FILE" <<EOF
-LAST_BINLOG=$NEXT_BINLOG
-LAST_POS=4
-EOF
+db_query "UPDATE migration_status SET \
+    current_binlog_file = '${NEXT_BINLOG//\'/\'\'}', \
+    current_binlog_position = $NEXT_POS, \
+    last_processed_timestamp = NOW() \
+    WHERE config_id = $CONFIG_ID;" \
+    || { log "ERROR: Failed to update migration_status with next binlog state"; exit 1; }
 
-log "State file updated:"
-log "$(cat "$STATE_FILE")"
+db_log_info "Advanced processing state to next binlog: $NEXT_BINLOG:$NEXT_POS" "$NEXT_BINLOG" "$NEXT_POS" ""
+db_log_info "Binlog iteration completed successfully: $CURRENT_BINLOG processed; continuing with next binlog $NEXT_BINLOG at position $NEXT_POS" "$CURRENT_BINLOG" "$NEXT_POS" ""
+log "Control database updated with next processing state"
 
 ############################################
 # CLEANUP
@@ -993,6 +1093,7 @@ section "CLEANUP"
 
 log "Removing temporary files"
 rm -f "$SQL_FILE" "$ERR_FILE"
+log "DEBUG: Retaining filtered_out files for audit/debugging (pattern: $WORKDIR/$CURRENT_BINLOG.filtered_out.sql)"
 
 ############################################
 # SCRIPT END
