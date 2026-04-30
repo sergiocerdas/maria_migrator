@@ -75,58 +75,11 @@ section() {
     log "========== $* =========="
 }
 
-filter_sql_by_gtids() {
-    local input_file="$1"
-    local gtids_file="$2"
-    local output_file="$3"
-    local filtered_out_file="$4"
-
-    : > "$output_file"
-    : > "$filtered_out_file"
-
-    awk -v keep_file="$output_file" -v drop_file="$filtered_out_file" '
-        NR == FNR {
-            if ($1 != "") {
-                drop_gtid[$1] = 1
-            }
-            next
-        }
-
-        function flush_block(target_file) {
-            if (!have_block) {
-                return
-            }
-
-            target_file = (current_gtid in drop_gtid) ? drop_file : keep_file
-            printf "%s", block_text >> target_file
-            block_text = ""
-            current_gtid = ""
-            have_block = 0
-        }
-
-        /^#.* GTID [0-9]-[0-9]-[0-9]/ {
-            flush_block()
-            current_gtid = $0
-            sub(/^.* GTID /, "", current_gtid)
-            sub(/[[:space:]].*$/, "", current_gtid)
-            block_text = $0 ORS
-            have_block = 1
-            next
-        }
-
-        {
-            if (have_block) {
-                block_text = block_text $0 ORS
-            } else {
-                print >> keep_file
-            }
-        }
-
-        END {
-            flush_block()
-        }
-    ' "$gtids_file" "$input_file"
-}
+# NOTE: filter_sql_by_gtids() function was removed.
+# Text-based GTID block filtering is unsafe because binlogs can have interleaved
+# events from different transactions between GTID headers. Filtering a GTID block
+# can accidentally capture COMMIT events from unrelated transactions.
+# Instead, we now allow maintenance transactions to apply to target (they're harmless).
 
 ############################################
 # DATABASE FUNCTIONS
@@ -467,6 +420,34 @@ fi
 log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
 
 ############################################
+# CUTOVER CONTROL CHECK
+############################################
+section "CUTOVER CONTROL CHECK"
+
+CUTOVER_SCHEDULED_AT=$(db_scalar "SELECT scheduled_cutover_at FROM cutover_control \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+CUTOVER_STATUS=$(db_scalar "SELECT cutover_status FROM cutover_control \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+CUTOVER_TRIGGER_NOW=$(db_scalar "SELECT trigger_cutover_now FROM cutover_control \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+CUTOVER_TRIGGER_NOW_AT=$(db_scalar "SELECT trigger_cutover_now_at FROM cutover_control \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+
+if [[ -z "$CUTOVER_SCHEDULED_AT" ]]; then
+    log "ERROR: No cutover date/time configured in cutover_control for config_id=$CONFIG_ID"
+    db_log_error "Cutover control missing scheduled_cutover_at in cutover_control; exiting" "" "" ""
+    exit 1
+fi
+
+if [[ "$CUTOVER_STATUS" == "CUTOVER_COMPLETE" ]]; then
+    log "Cutover already completed for this migration (cutover_status=CUTOVER_COMPLETE) — exiting"
+    db_log_info "Cutover already complete; skipping further processing" "" "" ""
+    exit 0
+fi
+
+log "Cutover schedule from DB: scheduled_cutover_at=$CUTOVER_SCHEDULED_AT status=${CUTOVER_STATUS:-UNKNOWN} trigger_cutover_now=${CUTOVER_TRIGGER_NOW:-0}"
+
+############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
 ############################################
 section "FAILOVER RESUME CHECK"
@@ -709,6 +690,81 @@ if grep -q "not closed properly" "$SQL_FILE"; then
 fi
 
 ############################################
+# CUTOVER / ACTIVE BINLOG STATUS SYNC
+############################################
+section "CUTOVER STATUS SYNC"
+
+CUTOVER_EFFECTIVE=0
+SCHEDULED_EPOCH=$(date -d "$CUTOVER_SCHEDULED_AT" +%s 2>/dev/null || true)
+NOW_EPOCH=$(date +%s)
+
+if [[ -z "$SCHEDULED_EPOCH" ]]; then
+    log "ERROR: Invalid scheduled_cutover_at format in cutover_control: '$CUTOVER_SCHEDULED_AT'"
+    db_log_error "Invalid cutover schedule format in cutover_control: $CUTOVER_SCHEDULED_AT" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    exit 1
+fi
+
+if [[ "$NOW_EPOCH" -ge "$SCHEDULED_EPOCH" ]]; then
+    CUTOVER_EFFECTIVE=1
+fi
+
+TRIGGER_DATE_MATCH=0
+if [[ "${CUTOVER_TRIGGER_NOW:-0}" =~ ^(1|TRUE|true)$ && -n "${CUTOVER_TRIGGER_NOW_AT:-}" ]]; then
+    SCHEDULED_DATE=$(date -d "$CUTOVER_SCHEDULED_AT" +%F 2>/dev/null || true)
+    TRIGGER_DATE=$(date -d "$CUTOVER_TRIGGER_NOW_AT" +%F 2>/dev/null || true)
+    if [[ -n "$SCHEDULED_DATE" && -n "$TRIGGER_DATE" && "$SCHEDULED_DATE" == "$TRIGGER_DATE" ]]; then
+        TRIGGER_DATE_MATCH=1
+        CUTOVER_EFFECTIVE=1
+    fi
+fi
+
+if [[ "${CUTOVER_TRIGGER_NOW:-0}" =~ ^(1|TRUE|true)$ && "$TRIGGER_DATE_MATCH" -ne 1 ]]; then
+    log "WARNING: trigger_cutover_now is set but trigger_cutover_now_at date does not match scheduled_cutover_at date; ignoring manual trigger"
+    db_log_warn "Ignored trigger_cutover_now because trigger date does not match scheduled cutover date" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+fi
+
+if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
+    db_query "UPDATE migration_status SET \
+        processing_status = 'ACTIVE_BINLOG_REACHED', \
+        last_processed_timestamp = NOW() \
+        WHERE config_id = $CONFIG_ID;" \
+        || log "WARNING: Failed to update migration_status to ACTIVE_BINLOG_REACHED"
+
+    if [[ "$CUTOVER_EFFECTIVE" -eq 1 ]]; then
+        db_query "UPDATE cutover_control SET \
+            cutover_status = 'CUTOVER_READY', \
+            cutover_ready_at = COALESCE(cutover_ready_at, NOW()) \
+            WHERE config_id = $CONFIG_ID \
+              AND cutover_status IN ('CUTOVER_PENDING','CUTOVER_READY');" \
+            || log "WARNING: Failed to update cutover_control to CUTOVER_READY"
+        log "Cutover status set to CUTOVER_READY (active binlog reached and cutover is effective)"
+    else
+        db_query "UPDATE cutover_control SET \
+            cutover_status = 'CUTOVER_PENDING' \
+            WHERE config_id = $CONFIG_ID \
+              AND cutover_status IN ('CUTOVER_PENDING','CUTOVER_READY');" \
+            || log "WARNING: Failed to keep cutover_control at CUTOVER_PENDING"
+        log "Active binlog reached before effective cutover window — keeping cutover status at CUTOVER_PENDING"
+    fi
+else
+    db_query "UPDATE migration_status SET \
+        processing_status = 'RUNNING', \
+        last_processed_timestamp = NOW() \
+        WHERE config_id = $CONFIG_ID \
+          AND processing_status = 'ACTIVE_BINLOG_REACHED';" \
+        || log "WARNING: Failed to update migration_status back to RUNNING"
+
+    if [[ "$CUTOVER_EFFECTIVE" -eq 0 ]]; then
+        db_query "UPDATE cutover_control SET \
+            cutover_status = 'CUTOVER_PENDING' \
+            WHERE config_id = $CONFIG_ID \
+              AND cutover_status = 'CUTOVER_READY';" \
+            || log "WARNING: Failed to revert cutover_control from CUTOVER_READY to CUTOVER_PENDING"
+        log "Binlog is not active and cutover is not effective — cutover status reverted/kept as CUTOVER_PENDING"
+    fi
+fi
+
+############################################
 # FAILOVER DETECTION
 ############################################
 section "FAILOVER DETECTION"
@@ -856,15 +912,11 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             "--stop-position=$FAILOVER_POS" \
             "$BINLOG_PATH" > "$PRE_FAILOVER_SQL" 2>/dev/null || true
 
-        # Remove foreign maintenance transactions from pre-failover SQL before apply
-        if [[ -s "$PRE_FAILOVER_SQL" && -s "$MAINTENANCE_GTIDS_FILE" ]]; then
-            PRE_FAILOVER_FILTERED_SQL="$WORKDIR/$CURRENT_BINLOG.prefailover.filtered.sql"
-            PRE_FAILOVER_FILTERED_OUT="$WORKDIR/$CURRENT_BINLOG.prefailover.filtered_out.sql"
-
-            filter_sql_by_gtids "$PRE_FAILOVER_SQL" "$MAINTENANCE_GTIDS_FILE" "$PRE_FAILOVER_FILTERED_SQL" "$PRE_FAILOVER_FILTERED_OUT"
-            log "DEBUG: Pre-failover filtered-out transactions saved to: $PRE_FAILOVER_FILTERED_OUT"
-
-            mv "$PRE_FAILOVER_FILTERED_SQL" "$PRE_FAILOVER_SQL"
+        # NOTE: We do NOT filter maintenance transactions from pre-failover SQL.
+        # Text-based GTID block filtering can accidentally capture unrelated events.
+        # Maintenance ops (truncate slow_log, etc.) are harmless to apply to target.
+        if [[ -s "$MAINTENANCE_GTIDS_FILE" ]]; then
+            log "DEBUG: Pre-failover range includes $MAINTENANCE_COUNT maintenance transaction(s); will apply (harmless)"
         fi
 
         if [[ -s "$PRE_FAILOVER_SQL" ]]; then
@@ -874,6 +926,7 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
                 log "Pre-failover transactions applied to target (up to position $FAILOVER_POS)"
             else
                 log "WARNING: Failed to apply pre-failover SQL — target may be incomplete"
+            fi
             fi
         else
             log "No pre-failover transactions to apply (empty SQL output for this range)"
@@ -980,18 +1033,16 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
         exit 10
 
     else
+        # SAFETY: Do NOT filter out maintenance transactions from the SQL file.
+        # Text-based GTID block filtering can accidentally capture unrelated events
+        # that appear between GTID headers (e.g., COMMIT events from other transactions).
+        #
+        # Instead, we just log that maintenance was detected and let the transactions
+        # apply to the target. Operations like "truncate mysql.slow_log" are harmless.
+        
         if [[ -s "$MAINTENANCE_GTIDS_FILE" ]]; then
-            FILTERED_SQL_FILE="$WORKDIR/$CURRENT_BINLOG.filtered.sql"
-            FILTERED_OUT_FILE="$WORKDIR/$CURRENT_BINLOG.filtered_out.sql"
-
-            filter_sql_by_gtids "$SQL_FILE" "$MAINTENANCE_GTIDS_FILE" "$FILTERED_SQL_FILE" "$FILTERED_OUT_FILE"
-
-            REMOVED_LINES=$(wc -l < "$FILTERED_OUT_FILE" | tr -d ' ')
-
-            log "DEBUG: Filtered-out transactions saved to: $FILTERED_OUT_FILE"
-
-            mv "$FILTERED_SQL_FILE" "$SQL_FILE"
-            log "Removed $TRANSACTION_COUNT foreign maintenance transaction block(s) from SQL file ($REMOVED_LINES line(s) removed)"
+            log "DEBUG: Foreign maintenance GTIDs detected: $(cat "$MAINTENANCE_GTIDS_FILE" | tr '\n' ' ')"
+            log "NOTE: Maintenance transactions will be applied to target (safe/idempotent operations)"
         fi
 
         rm -f "$MAINTENANCE_GTIDS_FILE"
@@ -999,7 +1050,7 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
         log "ANALYSIS COMPLETE - ALL FOREIGN TRANSACTIONS WERE MAINTENANCE:"
         log "  Maintenance operations : $MAINTENANCE_COUNT"
         log "  Total transactions     : $TRANSACTION_COUNT"
-        log "  Result: No failover detected, continuing binlog processing..."
+        log "  Result: No failover detected, maintenance ops will apply (harmless), continuing..."
     fi
 
 else
@@ -1017,8 +1068,8 @@ if [[ -s "$SQL_FILE" ]]; then
     BINLOG_CLOSE_COUNT=$(grep -c "^'/\\*!\\*/;$" "$SQL_FILE" || true)
 
     if [[ "$BINLOG_OPEN_COUNT" != "$BINLOG_CLOSE_COUNT" ]]; then
-        log "ERROR: Filtered SQL appears malformed: BINLOG open/close count mismatch (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)"
-        db_log_error "Malformed filtered SQL detected before apply: BINLOG open/close mismatch for $CURRENT_BINLOG (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+        log "ERROR: SQL file appears malformed: BINLOG open/close count mismatch (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)"
+        db_log_error "Malformed SQL detected before apply: BINLOG open/close mismatch for $CURRENT_BINLOG (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
         log "Keeping generated SQL artifacts for inspection: $SQL_FILE"
         exit 1
     fi
@@ -1093,7 +1144,6 @@ section "CLEANUP"
 
 log "Removing temporary files"
 rm -f "$SQL_FILE" "$ERR_FILE"
-log "DEBUG: Retaining filtered_out files for audit/debugging (pattern: $WORKDIR/$CURRENT_BINLOG.filtered_out.sql)"
 
 ############################################
 # SCRIPT END

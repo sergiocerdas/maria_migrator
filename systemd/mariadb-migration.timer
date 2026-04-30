@@ -1,0 +1,27 @@
+[Unit]
+Description=Run MariaDB Binlog Migration on schedule
+
+[Timer]
+# Run 10 minutes after boot
+OnBootSec=10min
+
+# Then every 60 minutes thereafter
+# Change this value to adjust frequency:
+#   OnUnitActiveSec=30s   → every 30 seconds
+#   OnUnitActiveSec=1min  → every 1 minute
+#   OnUnitActiveSec=5min  → every 5 minutes
+#   OnUnitActiveSec=60min  → every 60 minutes
+OnUnitActiveSec=10min
+
+# Randomize start by up to 25 seconds to avoid thundering herd
+# (useful when running on multiple nodes)
+RandomizedDelaySec=25
+
+# Persist timer across reboots
+Persistent=true
+
+# Accuracy - how much to coalesce with other timers (power saving)
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

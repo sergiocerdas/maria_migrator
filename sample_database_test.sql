@@ -186,6 +186,42 @@ END$$
 
 DELIMITER ;
 
+DELIMITER $$
+
+CREATE PROCEDURE reset_demo_data()
+BEGIN
+    -- Disable FK checks for safe truncation
+    SET FOREIGN_KEY_CHECKS = 0;
+
+    -- Clear child tables first
+    TRUNCATE TABLE payments;
+    TRUNCATE TABLE order_items;
+    TRUNCATE TABLE orders;
+
+    -- Optional: reset product stock to original baseline
+    UPDATE products
+    SET stock_qty = CASE product_id
+        WHEN 1 THEN 100
+        WHEN 2 THEN 200
+        WHEN 3 THEN 150
+        WHEN 4 THEN 80
+        WHEN 5 THEN 60
+        WHEN 6 THEN 120
+        WHEN 7 THEN 40
+        WHEN 8 THEN 90
+        ELSE 100
+    END;
+
+    -- Optional: clear customers if you want a full reset
+    -- (comment this out if you want to keep them)
+    -- TRUNCATE TABLE customers;
+
+    -- Re-enable FK checks
+    SET FOREIGN_KEY_CHECKS = 1;
+END$$
+
+DELIMITER ;
+
 
 -- Example usage:
 --CALL generate_sample_orders(100);

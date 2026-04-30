@@ -1,0 +1,47 @@
+[Unit]
+Description=MariaDB Binlog Migration Processor
+After=network.target mariadb.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Run as root (or change to migration-specific user)
+User=root
+Group=root
+
+# Working directory
+WorkingDirectory=/opt/mariadb-migration
+
+# Main script execution
+ExecStart=/opt/mariadb-migration/apply_incremental_binlogs_dbstate.sh /opt/mariadb-migration/migration.cfg
+
+# Handle exit codes:
+#   0  = Success, binlog processed
+#   10 = Failover detected, handoff triggered
+#   20 = Cutover complete
+# All are considered successful for systemd purposes
+SuccessExitStatus=0 10 20
+
+# Logging to journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mariadb-migration
+
+# Security hardening (optional - uncomment if desired)
+# ProtectSystem=strict
+# ProtectHome=true
+# NoNewPrivileges=true
+# PrivateTmp=true
+
+# Resource management (optional)
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=4
+
+# Prevent runaway processes
+TimeoutStartSec=600
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
