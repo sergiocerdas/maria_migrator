@@ -40,7 +40,8 @@ IOSchedulingClass=best-effort
 IOSchedulingPriority=4
 
 # Prevent runaway processes
-TimeoutStartSec=600
+# Set high timeout for large binlog files (30 minutes)
+TimeoutStartSec=1800
 TimeoutStopSec=30
 
 [Install]

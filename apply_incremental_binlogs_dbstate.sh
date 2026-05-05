@@ -52,10 +52,6 @@ if [[ "${SOURCE_CLUSTER_NODES[0]}" == "${SOURCE_CLUSTER_NODES[1]}" ]]; then
 fi
 
 CLUSTER_NODES=("${SOURCE_CLUSTER_NODES[@]}")
-CLUSTER_NODE_1="${CLUSTER_NODES[0]}"
-CLUSTER_NODE_2="${CLUSTER_NODES[1]}"
-
-
 
 echo "CLUSTER_NODES: (${CLUSTER_NODES[*]})"
 
@@ -64,6 +60,8 @@ echo "CLUSTER_NODES: (${CLUSTER_NODES[*]})"
 # LOGGING HELPERS
 ############################################
 mkdir -p "$WORKDIR"
+
+
 
 log() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') | $*" | tee -a "$LOG_FILE"
@@ -75,11 +73,20 @@ section() {
     log "========== $* =========="
 }
 
-# NOTE: filter_sql_by_gtids() function was removed.
-# Text-based GTID block filtering is unsafe because binlogs can have interleaved
-# events from different transactions between GTID headers. Filtering a GTID block
-# can accidentally capture COMMIT events from unrelated transactions.
-# Instead, we now allow maintenance transactions to apply to target (they're harmless).
+############################################
+# INSTANCE LOCK - prevent concurrent executions
+############################################
+LOCK_FILE="/var/run/mariadb-migration.lock"
+
+# Try to acquire an exclusive lock (non-blocking)
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    log "Another instance is already running — skipping this iteration"
+    exit 0
+fi
+
+# Write PID to lock file for debugging
+echo $$ >&200
 
 ############################################
 # DATABASE FUNCTIONS
@@ -191,10 +198,42 @@ db_log_critical() {
 
 section "CLUSTER CONFIGURATION"
 
-log "Cluster nodes defined:"
-log "  Node 1: ${CLUSTER_NODES[0]}"
-log "  Node 2: ${CLUSTER_NODES[1]}"
+log "Cluster nodes defined (${#CLUSTER_NODES[@]} total):"
+for _i in "${!CLUSTER_NODES[@]}"; do
+    log "  Node $((_i + 1)): ${CLUSTER_NODES[$_i]}"
+done
 log "Local host: $(hostname)"
+
+############################################
+# OS REQUIREMENTS
+############################################
+section "OS REQUIREMENTS"
+
+log "Checking for required commands: mariadb-binlog, mariadb"
+
+# Create mariadb-binlog symlink (required for podman-based MariaDB installations)
+if [[ -f /usr/bin/podman_client && ! -e /usr/bin/mariadb-binlog ]]; then
+    log "Creating symbolic link: /usr/bin/mariadb-binlog -> /usr/bin/podman_client"
+    ln -s /usr/bin/podman_client /usr/bin/mariadb-binlog
+elif [[ -L /usr/bin/mariadb-binlog ]]; then
+    log "Symbolic link /usr/bin/mariadb-binlog already exists"
+elif [[ -f /usr/bin/mariadb-binlog ]]; then
+    log "mariadb-binlog binary already exists at /usr/bin/mariadb-binlog"
+else
+    log "WARNING: /usr/bin/podman_client not found - mariadb-binlog symlink not created"
+fi
+
+# Create mariadb symlink (required for podman-based MariaDB installations)
+if [[ -f /usr/bin/podman_client && ! -e /usr/bin/mariadb ]]; then
+    log "Creating symbolic link: /usr/bin/mariadb -> /usr/bin/podman_client"
+    ln -s /usr/bin/podman_client /usr/bin/mariadb
+elif [[ -L /usr/bin/mariadb ]]; then
+    log "Symbolic link /usr/bin/mariadb already exists"
+elif [[ -f /usr/bin/mariadb ]]; then
+    log "mariadb binary already exists at /usr/bin/mariadb"
+else
+    log "WARNING: /usr/bin/podman_client not found - mariadb symlink not created"
+fi
 
 ############################################
 # SCRIPT START
@@ -203,6 +242,58 @@ section "SCRIPT START"
 log "PID=$$"
 log "WORKDIR=$WORKDIR"
 log "LOG_FILE=$LOG_FILE"
+
+############################################
+# CONTROL DATABASE INITIALIZATION
+############################################
+section "CONTROL DATABASE CHECK"
+
+# Check if control database exists; if not, create it from schema file
+_db_exists=$(mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+    --port="$DB_PORT" $DB_SSL --skip-column-names --batch \
+    -e "SELECT SCHEMA_NAME FROM INFORMATION_SCHEMA.SCHEMATA WHERE SCHEMA_NAME = '$DB_NAME';" 2>/dev/null || true)
+
+if [[ -z "$_db_exists" ]]; then
+    log "Control database '$DB_NAME' does not exist — attempting to create schema"
+
+    # Look for migration_control_database.sql in several locations
+    SCHEMA_FILE=""
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    CONFIG_DIR="$(dirname "$CONFIG_FILE")"
+
+    for _candidate in \
+        "$SCRIPT_DIR/migration_control_database.sql" \
+        "$CONFIG_DIR/migration_control_database.sql" \
+        "/opt/mariadb-migration/migration_control_database.sql"; do
+        if [[ -f "$_candidate" ]]; then
+            SCHEMA_FILE="$_candidate"
+            break
+        fi
+    done
+
+    if [[ -z "$SCHEMA_FILE" ]]; then
+        log "ERROR: Control database does not exist and migration_control_database.sql not found"
+        log "Searched locations:"
+        log "  - $SCRIPT_DIR/migration_control_database.sql"
+        log "  - $CONFIG_DIR/migration_control_database.sql"
+        log "  - /opt/mariadb-migration/migration_control_database.sql"
+        log "Please create the control database manually or place migration_control_database.sql in one of the above locations"
+        exit 1
+    fi
+
+    log "Found schema file: $SCHEMA_FILE"
+    log "Creating control database and tables..."
+
+    if mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+        --port="$DB_PORT" $DB_SSL < "$SCHEMA_FILE" 2>&1; then
+        log "Control database '$DB_NAME' created successfully"
+    else
+        log "ERROR: Failed to create control database from $SCHEMA_FILE"
+        exit 1
+    fi
+else
+    log "Control database '$DB_NAME' exists"
+fi
 
 ############################################
 # DETERMINE SERVER ID
@@ -769,16 +860,18 @@ fi
 ############################################
 section "FAILOVER DETECTION"
 
+# Initialize variables that may be referenced later (avoid unbound variable errors with set -u)
+MAINTENANCE_GTIDS_FILE="$WORKDIR/$CURRENT_BINLOG.maintenance_gtids.txt"
+MAINTENANCE_COUNT=0
+TRANSACTION_COUNT=0
+FAILOVER_DETECTED=0
+
 # Find foreign GTID header lines only (one line per foreign transaction start)
 ALL_FOREIGN_LINES=$(grep -n -E "server id $OTHER_SERVER_ID.*GTID [0-9]-[0-9]-[0-9]" "$SQL_FILE" || true)
 
 if [[ -n "$ALL_FOREIGN_LINES" ]]; then
     log "Found $(echo "$ALL_FOREIGN_LINES" | wc -l | tr -d ' ') foreign GTID transaction(s) to analyze"
 
-    MAINTENANCE_COUNT=0
-    TRANSACTION_COUNT=0
-    FAILOVER_DETECTED=0
-    MAINTENANCE_GTIDS_FILE="$WORKDIR/$CURRENT_BINLOG.maintenance_gtids.txt"
     : > "$MAINTENANCE_GTIDS_FILE"
 
     # Save the extraction start position before the loop overwrites CURRENT_POS
@@ -927,7 +1020,6 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             else
                 log "WARNING: Failed to apply pre-failover SQL — target may be incomplete"
             fi
-            fi
         else
             log "No pre-failover transactions to apply (empty SQL output for this range)"
         fi
@@ -1047,14 +1139,14 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
 
         rm -f "$MAINTENANCE_GTIDS_FILE"
 
-        log "ANALYSIS COMPLETE - ALL FOREIGN TRANSACTIONS WERE MAINTENANCE:"
+        log "ANALYSIS COMPLETE - ALL $TRANSACTION_COUNT FOREIGN TRANSACTION(S) WERE MAINTENANCE:"
         log "  Maintenance operations : $MAINTENANCE_COUNT"
         log "  Total transactions     : $TRANSACTION_COUNT"
         log "  Result: No failover detected, maintenance ops will apply (harmless), continuing..."
     fi
 
 else
-    log "No foreign server_id transactions found in this binlog"
+    log "No foreign server_id transactions found in this binlog — no failover detection needed"
 fi
 
 

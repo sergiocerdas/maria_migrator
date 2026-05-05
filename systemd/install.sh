@@ -39,6 +39,7 @@ mkdir -p "$INSTALL_DIR/workdir"
 # Copy scripts
 echo "Copying migration scripts..."
 cp "$SCRIPT_DIR/../apply_incremental_binlogs_dbstate.sh" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/../migration_control_database.sql" "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/../mariadb_export_databases.sh" "$INSTALL_DIR/" 2>/dev/null || true
 cp "$SCRIPT_DIR/../mariadb_extract_users_grants.sh" "$INSTALL_DIR/" 2>/dev/null || true
 cp "$SCRIPT_DIR/../mariadb_import_dump.sh" "$INSTALL_DIR/" 2>/dev/null || true
