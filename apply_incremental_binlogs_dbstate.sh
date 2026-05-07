@@ -89,6 +89,73 @@ fi
 echo $$ >&200
 
 ############################################
+# SIGNAL/CRASH HANDLER
+############################################
+
+# Track if we're in the middle of processing for crash reporting
+PROCESSING_STATE="INITIALIZING"
+PROCESSING_GTID=""
+PROCESSING_BINLOG=""
+PROCESSING_POSITION=""
+
+# Handler for signals and unexpected exits
+handle_interrupt() {
+    local exit_code=$?
+    local signal_name="${1:-UNKNOWN}"
+    
+    log ""
+    log "========== INTERRUPT/CRASH DETECTED =========="
+    log "Signal: $signal_name"
+    log "Exit code: $exit_code"
+    log "Processing state: $PROCESSING_STATE"
+    log "Current GTID: ${PROCESSING_GTID:-none}"
+    log "Current binlog: ${PROCESSING_BINLOG:-none}"
+    log "Current position: ${PROCESSING_POSITION:-none}"
+    
+    # Log to database if CONFIG_ID is available
+    if [[ -n "${CONFIG_ID:-}" && -n "${CURRENT_NODE_ID:-}" ]]; then
+        local msg="Script interrupted: signal=$signal_name state=$PROCESSING_STATE"
+        if [[ -n "$PROCESSING_GTID" ]]; then
+            msg+=" gtid=$PROCESSING_GTID"
+        fi
+        
+        # Use direct mysql call since db_log_critical might not work if db_log isn't fully initialized
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL "$DB_NAME" \
+              -e "INSERT INTO processing_log (config_id, node_id, log_level, log_message, binlog_file, binlog_position, gtid_position, process_pid, thread_info)
+                  VALUES ($CONFIG_ID, $CURRENT_NODE_ID, 'CRITICAL', 
+                          '${msg//\'/\'\'}',
+                          $(if [[ -n "$PROCESSING_BINLOG" ]]; then echo "'$PROCESSING_BINLOG'"; else echo "NULL"; fi),
+                          $(if [[ -n "$PROCESSING_POSITION" ]]; then echo "$PROCESSING_POSITION"; else echo "NULL"; fi),
+                          $(if [[ -n "$PROCESSING_GTID" ]]; then echo "'$PROCESSING_GTID'"; else echo "NULL"; fi),
+                          $$, 'crash_handler');" 2>/dev/null || true
+        
+        # Update migration_status to reflect interrupted state
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL "$DB_NAME" \
+              -e "UPDATE migration_status SET 
+                  processing_status = 'ERROR',
+                  last_processed_timestamp = NOW()
+                  WHERE config_id = $CONFIG_ID;" 2>/dev/null || true
+    fi
+    
+    log "Interrupt handling complete - exiting"
+    
+    # Exit with appropriate code
+    if [[ "$signal_name" == "EXIT" ]]; then
+        exit $exit_code
+    else
+        exit 130  # Standard exit code for SIGINT
+    fi
+}
+
+# Set up traps for various signals
+trap 'handle_interrupt SIGINT' SIGINT
+trap 'handle_interrupt SIGTERM' SIGTERM
+trap 'handle_interrupt SIGHUP' SIGHUP
+trap 'handle_interrupt EXIT' EXIT
+
+############################################
 # DATABASE FUNCTIONS
 ############################################
 
@@ -190,6 +257,57 @@ db_log_error() {
 
 db_log_critical() {
     db_log "CRITICAL" "$1" "$2" "$3" "$4"
+}
+
+############################################
+# BINLOG APPLY FUNCTION
+############################################
+
+# Apply extracted SQL to target database
+# Returns 0 on success, 1 on failure
+# Logs errors clearly to both file and control database
+apply_binlog_to_target() {
+    local sql_file="$1"
+    local binlog_file="$2"
+    local start_pos="$3"
+    
+    local output
+    local rc
+    
+    log "Applying binlog $binlog_file to target..."
+    db_log_info "Starting binlog apply: $binlog_file (start_pos=$start_pos)" "$binlog_file" "$start_pos" ""
+    
+    # Apply SQL to target
+    output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+        < "$sql_file" 2>&1)
+    rc=$?
+    
+    if [[ $rc -eq 0 ]]; then
+        log "Binlog applied successfully: $binlog_file"
+        db_log_info "Binlog applied successfully: $binlog_file" "$binlog_file" "$start_pos" ""
+        return 0
+    fi
+    
+    # Application failed - log error clearly
+    log "ERROR: Failed to apply binlog $binlog_file"
+    log "ERROR: MySQL exit code: $rc"
+    log "ERROR: MySQL output: $output"
+    
+    # Log to database with full error details
+    local escaped_output="${output//\'/\'\'}"  # Escape single quotes for SQL
+    escaped_output="${escaped_output:0:4000}"   # Truncate to avoid SQL issues
+    
+    db_log_error "BINLOG APPLY FAILED: $binlog_file - exit_code=$rc - $escaped_output" "$binlog_file" "$start_pos" ""
+    db_log_critical "ACTION REQUIRED: Binlog $binlog_file failed to apply. Manual intervention needed. Consider restoring from daily backup." "$binlog_file" "$start_pos" ""
+    
+    # Update migration status to ERROR state
+    db_query "UPDATE migration_status SET 
+        processing_status = 'ERROR',
+        last_processed_timestamp = NOW()
+        WHERE config_id = $CONFIG_ID;" 2>/dev/null || true
+    
+    return 1
 }
 
 ############################################
@@ -533,6 +651,7 @@ fi
 if [[ "$CUTOVER_STATUS" == "CUTOVER_COMPLETE" ]]; then
     log "Cutover already completed for this migration (cutover_status=CUTOVER_COMPLETE) — exiting"
     db_log_info "Cutover already complete; skipping further processing" "" "" ""
+    trap - EXIT
     exit 0
 fi
 
@@ -562,6 +681,7 @@ if [[ "$FAILOVER_STATUS" == "FAILOVER_HANDOFF" ]]; then
     if [[ "$HANDOFF_NODE_ID" != "$CURRENT_NODE_ID" ]]; then
         log "This node is not the designated new primary (db_node_id=$HANDOFF_NODE_ID, local_node_id=$CURRENT_NODE_ID)"
         log "Failover handoff belongs to another node — exiting"
+        trap - EXIT
         exit 0
     fi
 
@@ -727,6 +847,7 @@ fi
 if [[ "$LOCAL_SERVER_ID" != "$CURRENT_PROCESSING_SERVER_ID" ]]; then
     log "This node is not the current processing server (local_server_id=$LOCAL_SERVER_ID, current_processing_server_id=$CURRENT_PROCESSING_SERVER_ID)"
     db_log_info "Skipping iteration on non-processing server: local_server_id=$LOCAL_SERVER_ID current_processing_server_id=$CURRENT_PROCESSING_SERVER_ID" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    trap - EXIT
     exit 0
 fi
 
@@ -746,6 +867,7 @@ section "BINLOG SANITY CHECK"
 if [[ ! -f "$BINLOG_PATH" ]]; then
     log "Binlog does not exist → nothing to do  → Exiting"
     db_log_error "Binlog file not found, exiting: $BINLOG_PATH" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    trap - EXIT
     exit 0
 fi
 
@@ -866,6 +988,10 @@ MAINTENANCE_COUNT=0
 TRANSACTION_COUNT=0
 FAILOVER_DETECTED=0
 
+# Save the extraction start position before failover detection
+# The loop below may overwrite CURRENT_POS - we restore it afterward
+BINLOG_START_POS="$CURRENT_POS"
+
 # Find foreign GTID header lines only (one line per foreign transaction start)
 ALL_FOREIGN_LINES=$(grep -n -E "server id $OTHER_SERVER_ID.*GTID [0-9]-[0-9]-[0-9]" "$SQL_FILE" || true)
 
@@ -873,9 +999,6 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
     log "Found $(echo "$ALL_FOREIGN_LINES" | wc -l | tr -d ' ') foreign GTID transaction(s) to analyze"
 
     : > "$MAINTENANCE_GTIDS_FILE"
-
-    # Save the extraction start position before the loop overwrites CURRENT_POS
-    BINLOG_START_POS="$CURRENT_POS"
 
     # Process each foreign server_id transaction — stop at the first real failover
     while IFS= read -r FOREIGN_LINE_WITH_NUM; do
@@ -1122,6 +1245,7 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
         rm -f "$MAINTENANCE_GTIDS_FILE"
 
         # This node is no longer the active processor — exit immediately
+        trap - EXIT
         exit 10
 
     else
@@ -1149,6 +1273,13 @@ else
     log "No foreign server_id transactions found in this binlog — no failover detection needed"
 fi
 
+# IMPORTANT: Restore CURRENT_POS after failover detection
+# The failover detection loop overwrites CURRENT_POS while analyzing foreign transactions.
+# We must restore it to the original extraction position for the apply step.
+if [[ -n "${BINLOG_START_POS:-}" ]]; then
+    CURRENT_POS="$BINLOG_START_POS"
+    log "Restored CURRENT_POS to extraction start position: $CURRENT_POS"
+fi
 
 ############################################
 # PRE-APPLY SQL VALIDATION
@@ -1170,39 +1301,51 @@ fi
 
 
 ############################################
-# APPLY BINLOG TO TARGET
+# APPLY BINLOG TO TARGET (GTID-TRACKED)
 ############################################
 section "APPLY BINLOG TO TARGET"
+
+# Update processing state for crash tracking
+PROCESSING_STATE="APPLYING"
+PROCESSING_BINLOG="$CURRENT_BINLOG"
+PROCESSING_POSITION="$CURRENT_POS"
 
 if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
     log "Binlog is still in use and no failover handoff was triggered — skipping apply and state advancement safely"
     db_log_warn "Skipped apply/state advancement because binlog is still open: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
     rm -f "$SQL_FILE" "$ERR_FILE"
     log "$SQL_FILE and $ERR_FILE files deleted"
+    PROCESSING_STATE="COMPLETED_BINLOG_IN_USE"
     section "SCRIPT END"
     log "Execution completed safely (binlog-in-use guard)"
+    # Disable trap to avoid duplicate logging on clean exit
+    trap - EXIT
     exit 0
 fi
 
 if [[ -s "$SQL_FILE" ]]; then
-    APPLY_CMD=(
-        "$MYSQL"
-        "--host=$TARGET_HOST"
-        "--user=$TARGET_USER"
-        "--password=$TARGET_PASS"
-        "--port=$TARGET_PORT"
-        "--ssl=true"
-    )
-
-    log "Applying SQL file to target"
-    db_log_info "Applying binlog contents to target: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
-    log "Command:"
-    log "${APPLY_CMD[*]} < $SQL_FILE"
-
-    "${APPLY_CMD[@]}" < "$SQL_FILE"
-    log "Apply completed successfully"
+    log "Applying SQL file to target..."
+    
+    if apply_binlog_to_target "$SQL_FILE" "$CURRENT_BINLOG" "$CURRENT_POS"; then
+        log "Binlog apply completed successfully"
+        PROCESSING_STATE="APPLY_COMPLETE"
+    else
+        log "ERROR: Binlog apply failed for $CURRENT_BINLOG"
+        log "ERROR: Check processing_log table for details. Manual intervention required."
+        log "ERROR: Consider restoring from daily backup if data corruption occurred."
+        PROCESSING_STATE="APPLY_FAILED"
+        
+        # Keep SQL file for debugging
+        log "Keeping SQL file for debugging: $SQL_FILE"
+        rm -f "$ERR_FILE"
+        
+        # Exit with error - do not advance state
+        trap - EXIT
+        exit 1
+    fi
 else
     log "SQL file is empty → no transactions to apply"
+    PROCESSING_STATE="APPLY_COMPLETE_EMPTY"
 fi
 
 ############################################
@@ -1234,6 +1377,7 @@ log "Control database updated with next processing state"
 ############################################
 section "CLEANUP"
 
+PROCESSING_STATE="CLEANUP"
 log "Removing temporary files"
 rm -f "$SQL_FILE" "$ERR_FILE"
 
@@ -1241,6 +1385,11 @@ rm -f "$SQL_FILE" "$ERR_FILE"
 # SCRIPT END
 ############################################
 section "SCRIPT END"
+
+PROCESSING_STATE="COMPLETED"
 log "Execution completed successfully"
 
+# Disable trap before clean exit to avoid false positive crash logging
+trap - EXIT
 
+exit 0

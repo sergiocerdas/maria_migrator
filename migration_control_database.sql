@@ -142,6 +142,20 @@ CREATE TABLE cutover_control (
     INDEX idx_cutover_status (cutover_status),
     INDEX idx_scheduled_cutover_at (scheduled_cutover_at)
 );
+-- ============================================================================
+-- OPERATOR COMMAND: Initiate cutover by inserting a record into cutover_control for the migration config.
+-- ============================================================================
+-- INSERT INTO cutover_control (
+--    config_id,
+--    scheduled_cutover_at,
+--    trigger_cutover_now,
+--    cutover_status
+-- ) VALUES (
+--    1,                           -- Replace with your actual config_id
+--    '2026-05-15 22:00:00',       -- Replace with your scheduled cutover date/time
+--    FALSE,
+--    'CUTOVER_PENDING'
+-- );
 
 -- ============================================================================
 -- OPERATOR COMMAND: Trigger immediate cutover
@@ -232,6 +246,27 @@ CREATE TABLE processing_log (
     INDEX idx_binlog_file (binlog_file)
 );
 
+-- Track applied GTIDs for crash-safe resume
+-- Allows precise recovery after server reboot or script interruption
+CREATE TABLE applied_gtids (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    config_id INT NOT NULL,
+    source_gtid VARCHAR(50) NOT NULL,
+    binlog_file VARCHAR(255) NOT NULL,
+    binlog_position BIGINT UNSIGNED NOT NULL,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    
+    -- For duplicate key handling
+    duplicate_detected BOOLEAN DEFAULT FALSE,
+    duplicate_detected_at DATETIME NULL,
+    
+    FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
+    
+    UNIQUE KEY uq_config_gtid (config_id, source_gtid),
+    INDEX idx_config_binlog (config_id, binlog_file),
+    INDEX idx_applied_at (applied_at)
+) ENGINE=InnoDB;
+
 -- Function to encrypt passwords (simple AES encryption)
 DELIMITER //
 CREATE FUNCTION encrypt_password(plain_password TEXT, encryption_key VARCHAR(255))
@@ -255,6 +290,7 @@ CREATE PROCEDURE reset_all_data()
 BEGIN
     SET FOREIGN_KEY_CHECKS = 0;
 
+    TRUNCATE TABLE applied_gtids;
     TRUNCATE TABLE processing_log;
     TRUNCATE TABLE failover_events;
     TRUNCATE TABLE cutover_control;
