@@ -851,25 +851,43 @@ if [[ "$LOCAL_SERVER_ID" != "$CURRENT_PROCESSING_SERVER_ID" ]]; then
     exit 0
 fi
 
-BINLOG_PATH="$BINLOG_DIR/$CURRENT_BINLOG"
-SQL_FILE="$WORKDIR/$CURRENT_BINLOG.sql"
-ERR_FILE="$WORKDIR/$CURRENT_BINLOG.err"
-
-log "BINLOG_PATH=$BINLOG_PATH"
-log "SQL_FILE=$SQL_FILE"
-log "ERR_FILE=$ERR_FILE"
-
 ############################################
-# BINLOG EXISTENCE CHECK
+# BINLOG PROCESSING LOOP
 ############################################
-section "BINLOG SANITY CHECK"
+# Process all available binlogs until a stop condition:
+#   - Binlog file doesn't exist (caught up)
+#   - Active binlog reached (still being written)
+#   - Failover detected (handoff to other node)
+#   - Error during apply
+############################################
 
-if [[ ! -f "$BINLOG_PATH" ]]; then
-    log "Binlog does not exist → nothing to do  → Exiting"
-    db_log_error "Binlog file not found, exiting: $BINLOG_PATH" "$CURRENT_BINLOG" "$CURRENT_POS" ""
-    trap - EXIT
-    exit 0
-fi
+TOTAL_BINLOGS_PROCESSED=0
+LOOP_START_TIME=$(date +%s)
+
+while true; do
+    # Update paths for current binlog
+    BINLOG_PATH="$BINLOG_DIR/$CURRENT_BINLOG"
+    SQL_FILE="$WORKDIR/$CURRENT_BINLOG.sql"
+    ERR_FILE="$WORKDIR/$CURRENT_BINLOG.err"
+
+    section "PROCESSING BINLOG: $CURRENT_BINLOG (iteration $((TOTAL_BINLOGS_PROCESSED + 1)))"
+    log "BINLOG_PATH=$BINLOG_PATH"
+    log "SQL_FILE=$SQL_FILE"
+    log "ERR_FILE=$ERR_FILE"
+
+    ############################################
+    # BINLOG EXISTENCE CHECK
+    ############################################
+    
+    if [[ ! -f "$BINLOG_PATH" ]]; then
+        log "Binlog does not exist → caught up with available binlogs"
+        if [[ $TOTAL_BINLOGS_PROCESSED -gt 0 ]]; then
+            db_log_info "Binlog processing complete: $TOTAL_BINLOGS_PROCESSED binlog(s) processed, caught up at $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+        else
+            db_log_info "No binlogs to process: $CURRENT_BINLOG not found" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+        fi
+        break  # Exit loop - caught up
+    fi
 
 ############################################
 # BINLOG EXTRACTION
@@ -914,6 +932,7 @@ NOW_EPOCH=$(date +%s)
 if [[ -z "$SCHEDULED_EPOCH" ]]; then
     log "ERROR: Invalid scheduled_cutover_at format in cutover_control: '$CUTOVER_SCHEDULED_AT'"
     db_log_error "Invalid cutover schedule format in cutover_control: $CUTOVER_SCHEDULED_AT" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    trap - EXIT
     exit 1
 fi
 
@@ -1294,6 +1313,7 @@ if [[ -s "$SQL_FILE" ]]; then
         log "ERROR: SQL file appears malformed: BINLOG open/close count mismatch (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)"
         db_log_error "Malformed SQL detected before apply: BINLOG open/close mismatch for $CURRENT_BINLOG (open=$BINLOG_OPEN_COUNT close=$BINLOG_CLOSE_COUNT)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
         log "Keeping generated SQL artifacts for inspection: $SQL_FILE"
+        trap - EXIT
         exit 1
     fi
 fi
@@ -1311,16 +1331,11 @@ PROCESSING_BINLOG="$CURRENT_BINLOG"
 PROCESSING_POSITION="$CURRENT_POS"
 
 if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
-    log "Binlog is still in use and no failover handoff was triggered — skipping apply and state advancement safely"
-    db_log_warn "Skipped apply/state advancement because binlog is still open: $CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    log "Binlog is still in use and no failover handoff was triggered — skipping apply and state advancement"
+    db_log_info "Reached active binlog: $CURRENT_BINLOG (processed $TOTAL_BINLOGS_PROCESSED binlog(s) this run)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
     rm -f "$SQL_FILE" "$ERR_FILE"
-    log "$SQL_FILE and $ERR_FILE files deleted"
     PROCESSING_STATE="COMPLETED_BINLOG_IN_USE"
-    section "SCRIPT END"
-    log "Execution completed safely (binlog-in-use guard)"
-    # Disable trap to avoid duplicate logging on clean exit
-    trap - EXIT
-    exit 0
+    break  # Exit loop - reached active binlog
 fi
 
 if [[ -s "$SQL_FILE" ]]; then
@@ -1365,29 +1380,55 @@ db_query "UPDATE migration_status SET \
     current_binlog_file = '${NEXT_BINLOG//\'/\'\'}', \
     current_binlog_position = $NEXT_POS, \
     last_processed_timestamp = NOW() \
-    WHERE config_id = $CONFIG_ID;" \
-    || { log "ERROR: Failed to update migration_status with next binlog state"; exit 1; }
+    WHERE config_id = $CONFIG_ID;"
+
+if [[ $? -ne 0 ]]; then
+    log "ERROR: Failed to update migration_status with next binlog state"
+    trap - EXIT
+    exit 1
+fi
 
 db_log_info "Advanced processing state to next binlog: $NEXT_BINLOG:$NEXT_POS" "$NEXT_BINLOG" "$NEXT_POS" ""
 db_log_info "Binlog iteration completed successfully: $CURRENT_BINLOG processed; continuing with next binlog $NEXT_BINLOG at position $NEXT_POS" "$CURRENT_BINLOG" "$NEXT_POS" ""
 log "Control database updated with next processing state"
 
 ############################################
-# CLEANUP
+# CLEANUP FOR THIS BINLOG
 ############################################
-section "CLEANUP"
 
-PROCESSING_STATE="CLEANUP"
-log "Removing temporary files"
+log "Removing temporary files for $CURRENT_BINLOG"
 rm -f "$SQL_FILE" "$ERR_FILE"
 
+# Increment counter
+TOTAL_BINLOGS_PROCESSED=$((TOTAL_BINLOGS_PROCESSED + 1))
+
+# Update CURRENT_BINLOG and CURRENT_POS for next iteration
+CURRENT_BINLOG="$NEXT_BINLOG"
+CURRENT_POS="$NEXT_POS"
+
+log "Continuing to next binlog: $CURRENT_BINLOG"
+log ""
+
+done  # End of binlog processing loop
+
 ############################################
-# SCRIPT END
+# SCRIPT END - SUMMARY
 ############################################
 section "SCRIPT END"
 
+LOOP_END_TIME=$(date +%s)
+LOOP_DURATION=$((LOOP_END_TIME - LOOP_START_TIME))
+
 PROCESSING_STATE="COMPLETED"
 log "Execution completed successfully"
+log "Summary:"
+log "  Total binlogs processed: $TOTAL_BINLOGS_PROCESSED"
+log "  Total duration: ${LOOP_DURATION} seconds"
+log "  Next binlog to process: $CURRENT_BINLOG"
+
+if [[ $TOTAL_BINLOGS_PROCESSED -gt 0 ]]; then
+    db_log_info "Binlog processing run complete: processed $TOTAL_BINLOGS_PROCESSED binlog(s) in ${LOOP_DURATION}s, next=$CURRENT_BINLOG" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+fi
 
 # Disable trap before clean exit to avoid false positive crash logging
 trap - EXIT
