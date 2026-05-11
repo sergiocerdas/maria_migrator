@@ -137,6 +137,36 @@ handle_interrupt() {
                   processing_status = 'ERROR',
                   last_processed_timestamp = NOW()
                   WHERE config_id = $CONFIG_ID;" 2>/dev/null || true
+        
+        # Mark any in-progress checkpoints as INTERRUPTED
+        # This provides recovery information for partially applied binlogs
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL "$DB_NAME" \
+              -e "UPDATE binlog_apply_checkpoints SET 
+                  apply_status = 'INTERRUPTED',
+                  apply_completed_at = NOW(),
+                  error_message = 'Process interrupted: signal=$signal_name'
+                  WHERE config_id = $CONFIG_ID 
+                    AND apply_status = 'STARTED'
+                    AND process_pid = $$;" 2>/dev/null || true
+        
+        # Log recovery information if we have a PROCESSING_BINLOG
+        if [[ -n "$PROCESSING_BINLOG" && "$PROCESSING_STATE" == "APPLYING" ]]; then
+            local recovery_info
+            recovery_info=$(mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+                  --port="$DB_PORT" $DB_SSL --skip-column-names --batch "$DB_NAME" \
+                  -e "SELECT CONCAT('Recovery point: ', target_binlog_file_before, ':', target_binlog_position_before, ' (checkpoint_id=', checkpoint_id, ')')
+                      FROM binlog_apply_checkpoints 
+                      WHERE config_id = $CONFIG_ID 
+                        AND source_binlog_file = '$PROCESSING_BINLOG'
+                        AND apply_status = 'INTERRUPTED'
+                      ORDER BY checkpoint_id DESC LIMIT 1;" 2>/dev/null || true)
+            
+            if [[ -n "$recovery_info" ]]; then
+                log "RECOVERY INFO: $recovery_info"
+                log "Use flashback/PITR to target binlog position above to restore pre-apply state"
+            fi
+        fi
     fi
     
     log "Interrupt handling complete - exiting"
@@ -266,6 +296,7 @@ db_log_critical() {
 # Apply extracted SQL to target database
 # Returns 0 on success, 1 on failure
 # Logs errors clearly to both file and control database
+# Creates checkpoint with target binlog position before apply for recovery
 apply_binlog_to_target() {
     local sql_file="$1"
     local binlog_file="$2"
@@ -273,33 +304,152 @@ apply_binlog_to_target() {
     
     local output
     local rc
+    local checkpoint_id=""
     
     log "Applying binlog $binlog_file to target..."
-    db_log_info "Starting binlog apply: $binlog_file (start_pos=$start_pos)" "$binlog_file" "$start_pos" ""
     
-    # Apply SQL to target
+    ############################################
+    # GET TARGET BINLOG POSITION (BEFORE APPLY)
+    ############################################
+    # Query target database's current binlog position for recovery checkpoint
+    local target_status
+    target_status=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+        --skip-column-names --batch \
+        -e "SHOW MASTER STATUS;" 2>/dev/null)
+    
+    local target_binlog_before=""
+    local target_pos_before=""
+    local target_gtid_before=""
+    
+    if [[ -n "$target_status" ]]; then
+        target_binlog_before=$(echo "$target_status" | awk '{print $1}')
+        target_pos_before=$(echo "$target_status" | awk '{print $2}')
+        # GTID is typically in column 5 for MariaDB
+        target_gtid_before=$(echo "$target_status" | awk '{print $5}')
+        
+        log "Target checkpoint BEFORE apply:"
+        log "  Target binlog: $target_binlog_before"
+        log "  Target position: $target_pos_before"
+        log "  Target GTID: ${target_gtid_before:-none}"
+    else
+        log "WARNING: Could not get target binlog position - checkpoint will be incomplete"
+    fi
+    
+    ############################################
+    # CREATE CHECKPOINT RECORD
+    ############################################
+    if [[ -n "$target_binlog_before" && -n "$target_pos_before" ]]; then
+        db_query "INSERT INTO binlog_apply_checkpoints (
+            config_id,
+            source_binlog_file,
+            source_binlog_position,
+            target_binlog_file_before,
+            target_binlog_position_before,
+            target_gtid_before,
+            apply_status,
+            process_pid,
+            process_hostname
+        ) VALUES (
+            $CONFIG_ID,
+            '${binlog_file//\'/\'\'}',
+            $start_pos,
+            '${target_binlog_before//\'/\'\'}',
+            $target_pos_before,
+            $(if [[ -n "$target_gtid_before" ]]; then echo "'${target_gtid_before//\'/\'\'}'"; else echo "NULL"; fi),
+            'STARTED',
+            $$,
+            '$(hostname -s)'
+        );" 2>/dev/null
+        
+        # Get the checkpoint ID for later update
+        checkpoint_id=$(db_scalar "SELECT MAX(checkpoint_id) FROM binlog_apply_checkpoints 
+            WHERE config_id = $CONFIG_ID AND source_binlog_file = '${binlog_file//\'/\'\'}';")
+        
+        log "Checkpoint created: ID=$checkpoint_id (recovery point: $target_binlog_before:$target_pos_before)"
+    fi
+    
+    db_log_info "Starting binlog apply: $binlog_file (start_pos=$start_pos) checkpoint=$checkpoint_id target_recovery_point=$target_binlog_before:$target_pos_before" "$binlog_file" "$start_pos" ""
+    
+    ############################################
+    # APPLY SQL TO TARGET
+    ############################################
     output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
         "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
         < "$sql_file" 2>&1)
     rc=$?
     
+    ############################################
+    # HANDLE SUCCESS
+    ############################################
     if [[ $rc -eq 0 ]]; then
         log "Binlog applied successfully: $binlog_file"
-        db_log_info "Binlog applied successfully: $binlog_file" "$binlog_file" "$start_pos" ""
+        
+        # Get target position AFTER apply
+        local target_status_after
+        target_status_after=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+            "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+            --skip-column-names --batch \
+            -e "SHOW MASTER STATUS;" 2>/dev/null)
+        
+        local target_binlog_after=""
+        local target_pos_after=""
+        local target_gtid_after=""
+        
+        if [[ -n "$target_status_after" ]]; then
+            target_binlog_after=$(echo "$target_status_after" | awk '{print $1}')
+            target_pos_after=$(echo "$target_status_after" | awk '{print $2}')
+            target_gtid_after=$(echo "$target_status_after" | awk '{print $5}')
+        fi
+        
+        # Update checkpoint as completed
+        if [[ -n "$checkpoint_id" ]]; then
+            db_query "UPDATE binlog_apply_checkpoints SET
+                apply_status = 'COMPLETED',
+                apply_completed_at = NOW(),
+                target_binlog_file_after = $(if [[ -n "$target_binlog_after" ]]; then echo "'${target_binlog_after//\'/\'\'}'"; else echo "NULL"; fi),
+                target_binlog_position_after = $(if [[ -n "$target_pos_after" ]]; then echo "$target_pos_after"; else echo "NULL"; fi),
+                target_gtid_after = $(if [[ -n "$target_gtid_after" ]]; then echo "'${target_gtid_after//\'/\'\'}'"; else echo "NULL"; fi)
+                WHERE checkpoint_id = $checkpoint_id;" 2>/dev/null || true
+        fi
+        
+        db_log_info "Binlog applied successfully: $binlog_file checkpoint=$checkpoint_id" "$binlog_file" "$start_pos" ""
         return 0
     fi
     
-    # Application failed - log error clearly
+    ############################################
+    # HANDLE FAILURE
+    ############################################
     log "ERROR: Failed to apply binlog $binlog_file"
     log "ERROR: MySQL exit code: $rc"
     log "ERROR: MySQL output: $output"
+    log ""
+    log "========== RECOVERY INFORMATION =========="
+    log "To recover target database to pre-apply state:"
+    log "  Target binlog file: $target_binlog_before"
+    log "  Target position: $target_pos_before"
+    log "  Target GTID: ${target_gtid_before:-none}"
+    log "  Checkpoint ID: ${checkpoint_id:-none}"
+    log ""
+    log "Use point-in-time recovery or flashback to: $target_binlog_before:$target_pos_before"
+    log "==========================================="
     
     # Log to database with full error details
     local escaped_output="${output//\'/\'\'}"  # Escape single quotes for SQL
     escaped_output="${escaped_output:0:4000}"   # Truncate to avoid SQL issues
     
+    # Update checkpoint as failed
+    if [[ -n "$checkpoint_id" ]]; then
+        db_query "UPDATE binlog_apply_checkpoints SET
+            apply_status = 'FAILED',
+            apply_completed_at = NOW(),
+            error_message = '${escaped_output:0:2000}',
+            error_code = $rc
+            WHERE checkpoint_id = $checkpoint_id;" 2>/dev/null || true
+    fi
+    
     db_log_error "BINLOG APPLY FAILED: $binlog_file - exit_code=$rc - $escaped_output" "$binlog_file" "$start_pos" ""
-    db_log_critical "ACTION REQUIRED: Binlog $binlog_file failed to apply. Manual intervention needed. Consider restoring from daily backup." "$binlog_file" "$start_pos" ""
+    db_log_critical "ACTION REQUIRED: Binlog $binlog_file failed. Recovery point: $target_binlog_before:$target_pos_before (checkpoint_id=$checkpoint_id). Use flashback/PITR to recover target." "$binlog_file" "$start_pos" ""
     
     # Update migration status to ERROR state
     db_query "UPDATE migration_status SET 

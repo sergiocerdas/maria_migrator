@@ -246,26 +246,81 @@ CREATE TABLE processing_log (
     INDEX idx_binlog_file (binlog_file)
 );
 
--- Track applied GTIDs for crash-safe resume
--- Allows precise recovery after server reboot or script interruption
-CREATE TABLE applied_gtids (
-    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+-- Track target database binlog position before each source binlog apply
+-- This enables point-in-time recovery (flashback) if apply fails or is interrupted
+-- Recovery: Use target_binlog_file_before/target_binlog_position_before to flashback target DB
+CREATE TABLE binlog_apply_checkpoints (
+    checkpoint_id BIGINT AUTO_INCREMENT PRIMARY KEY,
     config_id INT NOT NULL,
-    source_gtid VARCHAR(50) NOT NULL,
-    binlog_file VARCHAR(255) NOT NULL,
-    binlog_position BIGINT UNSIGNED NOT NULL,
-    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     
-    -- For duplicate key handling
-    duplicate_detected BOOLEAN DEFAULT FALSE,
-    duplicate_detected_at DATETIME NULL,
+    -- Source binlog being applied
+    source_binlog_file VARCHAR(255) NOT NULL,
+    source_binlog_position BIGINT UNSIGNED NOT NULL,
+    
+    -- Target database state BEFORE apply (recovery point)
+    target_binlog_file_before VARCHAR(255) NOT NULL,
+    target_binlog_position_before BIGINT UNSIGNED NOT NULL,
+    target_gtid_before VARCHAR(500),
+    
+    -- Target database state AFTER apply (if completed successfully)
+    target_binlog_file_after VARCHAR(255),
+    target_binlog_position_after BIGINT UNSIGNED,
+    target_gtid_after VARCHAR(500),
+    
+    -- Apply status tracking
+    apply_status ENUM('STARTED', 'COMPLETED', 'FAILED', 'INTERRUPTED') DEFAULT 'STARTED',
+    apply_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    apply_completed_at TIMESTAMP NULL,
+    
+    -- Error information (if failed)
+    error_message TEXT,
+    error_code INT,
+    
+    -- Metadata
+    process_pid INT,
+    process_hostname VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     
     FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
     
-    UNIQUE KEY uq_config_gtid (config_id, source_gtid),
-    INDEX idx_config_binlog (config_id, binlog_file),
-    INDEX idx_applied_at (applied_at)
+    INDEX idx_config_source_binlog (config_id, source_binlog_file),
+    INDEX idx_apply_status (apply_status),
+    INDEX idx_apply_started (apply_started_at),
+    INDEX idx_target_binlog (target_binlog_file_before, target_binlog_position_before)
 ) ENGINE=InnoDB;
+
+-- ============================================================================
+-- RECOVERY PROCEDURE: Point-in-Time Recovery after failed/interrupted apply
+-- ============================================================================
+-- If a binlog apply fails or is interrupted, use the checkpoint data to recover:
+--
+-- 1. Find the failed/interrupted checkpoint:
+--    SELECT * FROM binlog_apply_checkpoints 
+--    WHERE apply_status IN ('FAILED', 'INTERRUPTED') 
+--    ORDER BY checkpoint_id DESC LIMIT 1;
+--
+-- 2. Use the target_binlog_file_before and target_binlog_position_before 
+--    to perform point-in-time recovery on the TARGET database:
+--
+--    Option A: Using mariabackup flashback (if available):
+--      mariabackup --prepare --target-dir=/backup/path \
+--        --apply-log-only \
+--        --binlog-info=<target_binlog_file_before>,<target_binlog_position_before>
+--
+--    Option B: Using mysqlbinlog to revert (if binlog still available):
+--      mysqlbinlog --start-position=<target_binlog_position_before> \
+--        /var/lib/mysql/<target_binlog_file_before> | mysql
+--
+--    Option C: Restore from backup + replay binlogs up to recovery point
+--
+-- 3. After recovery, update migration_status to resume from the failed binlog:
+--    UPDATE migration_status SET 
+--      current_binlog_file = '<source_binlog_file>',
+--      current_binlog_position = <source_binlog_position>,
+--      processing_status = 'RUNNING'
+--    WHERE config_id = <config_id>;
+-- ============================================================================
 
 -- Function to encrypt passwords (simple AES encryption)
 DELIMITER //
@@ -290,7 +345,7 @@ CREATE PROCEDURE reset_all_data()
 BEGIN
     SET FOREIGN_KEY_CHECKS = 0;
 
-    TRUNCATE TABLE applied_gtids;
+    TRUNCATE TABLE binlog_apply_checkpoints;
     TRUNCATE TABLE processing_log;
     TRUNCATE TABLE failover_events;
     TRUNCATE TABLE cutover_control;
@@ -366,3 +421,38 @@ INSERT INTO migration_status (
 
 */
 
+-- ============================================================================
+-- UPGRADE SCRIPT: Add binlog_apply_checkpoints table to existing deployments
+-- ============================================================================
+-- Run this if you have an existing control database that was created before
+-- the checkpoint feature was added:
+--
+-- USE mariaDBaaS_migcontrol;
+-- 
+-- CREATE TABLE IF NOT EXISTS binlog_apply_checkpoints (
+--     checkpoint_id BIGINT AUTO_INCREMENT PRIMARY KEY,
+--     config_id INT NOT NULL,
+--     source_binlog_file VARCHAR(255) NOT NULL,
+--     source_binlog_position BIGINT UNSIGNED NOT NULL,
+--     target_binlog_file_before VARCHAR(255) NOT NULL,
+--     target_binlog_position_before BIGINT UNSIGNED NOT NULL,
+--     target_gtid_before VARCHAR(500),
+--     target_binlog_file_after VARCHAR(255),
+--     target_binlog_position_after BIGINT UNSIGNED,
+--     target_gtid_after VARCHAR(500),
+--     apply_status ENUM('STARTED', 'COMPLETED', 'FAILED', 'INTERRUPTED') DEFAULT 'STARTED',
+--     apply_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--     apply_completed_at TIMESTAMP NULL,
+--     error_message TEXT,
+--     error_code INT,
+--     process_pid INT,
+--     process_hostname VARCHAR(255),
+--     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+--     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+--     FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
+--     INDEX idx_config_source_binlog (config_id, source_binlog_file),
+--     INDEX idx_apply_status (apply_status),
+--     INDEX idx_apply_started (apply_started_at),
+--     INDEX idx_target_binlog (target_binlog_file_before, target_binlog_position_before)
+-- ) ENGINE=InnoDB;
+-- ============================================================================
