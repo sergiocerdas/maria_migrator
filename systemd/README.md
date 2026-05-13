@@ -140,23 +140,12 @@ systemctl daemon-reload
 systemctl restart mariadb-migration.timer
 ```
 
-### Trigger Cutover
-
-Connect to the control database and run:
-```sql
-UPDATE cutover_control
-SET trigger_cutover_now = 1,
-    trigger_cutover_now_at = NOW()
-WHERE config_id = <CONFIG_ID>;
-```
-
 ## Exit Codes
 
 | Code | Meaning | Timer Behavior |
 |------|---------|----------------|
 | 0 | Success, binlog processed | Timer reschedules normally |
 | 10 | Failover detected, handoff triggered | Timer reschedules normally |
-| 20 | Cutover complete | Timer reschedules normally |
 | Other | Error | Timer reschedules normally (check logs) |
 
 ## Troubleshooting

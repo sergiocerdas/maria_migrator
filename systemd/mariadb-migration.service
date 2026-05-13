@@ -19,9 +19,8 @@ ExecStart=/opt/mariadb-migration/apply_incremental_binlogs_dbstate.sh /opt/maria
 # Handle exit codes:
 #   0  = Success, binlog processed
 #   10 = Failover detected, handoff triggered
-#   20 = Cutover complete
 # All are considered successful for systemd purposes
-SuccessExitStatus=0 10 20
+SuccessExitStatus=0 10
 
 # Logging to journald
 StandardOutput=journal

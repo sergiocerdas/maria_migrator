@@ -37,8 +37,8 @@ CREATE TABLE migration_config (
     migration_password_encrypted TEXT NOT NULL, -- AES encrypted
     
     -- Status and Control
-    is_active BOOLEAN DEFAULT TRUE,
-    is_paused BOOLEAN DEFAULT FALSE,
+    is_active BOOLEAN DEFAULT FALSE,
+    is_paused BOOLEAN DEFAULT TRUE, -- Start in paused state until operator explicitly starts migration
     
     -- Metadata
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -160,64 +160,6 @@ CREATE TABLE migration_status (
 --       error_message = 'Manually verified and cleared by operator'
 --   WHERE config_id = <CONFIG_ID> 
 --     AND apply_status IN ('STARTED', 'FAILED', 'INTERRUPTED');
--- ============================================================================
-
--- Cutover control and state machine (separate from migration_status)
-CREATE TABLE cutover_control (
-    cutover_id INT AUTO_INCREMENT PRIMARY KEY,
-    config_id INT NOT NULL,
-
-    -- Manually managed schedule (required)
-    scheduled_cutover_at DATETIME NOT NULL,
-
-    -- Manual override: request cutover now.
-    -- Valid only when requested_at date equals DATE(scheduled_cutover_at).
-    trigger_cutover_now BOOLEAN DEFAULT FALSE,
-    trigger_cutover_now_at DATETIME NULL,
-
-    -- Cutover state machine
-    cutover_status ENUM('CUTOVER_PENDING','CUTOVER_READY','CUTOVER_CONFIRMED','CUTOVER_COMPLETE') DEFAULT 'CUTOVER_PENDING',
-
-    -- Audit timestamps
-    cutover_ready_at DATETIME NULL,
-    cutover_confirmed_at DATETIME NULL,
-    cutover_completed_at DATETIME NULL,
-
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
-    UNIQUE KEY unique_config_cutover (config_id),
-    INDEX idx_cutover_status (cutover_status),
-    INDEX idx_scheduled_cutover_at (scheduled_cutover_at)
-);
--- ============================================================================
--- OPERATOR COMMAND: Initiate cutover by inserting a record into cutover_control for the migration config.
--- ============================================================================
--- INSERT INTO cutover_control (
---    config_id,
---    scheduled_cutover_at,
---    trigger_cutover_now,
---    cutover_status
--- ) VALUES (
---    1,                           -- Replace with your actual config_id
---    '2026-05-15 22:00:00',       -- Replace with your scheduled cutover date/time
---    FALSE,
---    'CUTOVER_PENDING'
--- );
-
--- ============================================================================
--- OPERATOR COMMAND: Trigger immediate cutover
--- ============================================================================
--- Use this command to manually trigger cutover before the scheduled time.
--- The trigger is only valid if executed on the SAME calendar date as the
--- scheduled_cutover_at. If dates don't match, the script ignores the trigger
--- and logs a warning.
---
--- UPDATE cutover_control
--- SET trigger_cutover_now = 1,
---     trigger_cutover_now_at = NOW()
--- WHERE config_id = <CONFIG_ID>;
 -- ============================================================================
 
 -- Failover detection and handoff information
@@ -540,7 +482,6 @@ BEGIN
     TRUNCATE TABLE binlog_apply_checkpoints;
     TRUNCATE TABLE processing_log;
     TRUNCATE TABLE failover_events;
-    TRUNCATE TABLE cutover_control;
     TRUNCATE TABLE migration_status;
     TRUNCATE TABLE source_cluster_mapping;
     TRUNCATE TABLE migration_config;

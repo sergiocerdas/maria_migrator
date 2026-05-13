@@ -923,35 +923,6 @@ fi
 log "Migration is not paused — continuing"
 
 ############################################
-# CUTOVER CONTROL CHECK
-############################################
-section "CUTOVER CONTROL CHECK"
-
-CUTOVER_SCHEDULED_AT=$(db_scalar "SELECT scheduled_cutover_at FROM cutover_control \
-    WHERE config_id = $CONFIG_ID LIMIT 1;")
-CUTOVER_STATUS=$(db_scalar "SELECT cutover_status FROM cutover_control \
-    WHERE config_id = $CONFIG_ID LIMIT 1;")
-CUTOVER_TRIGGER_NOW=$(db_scalar "SELECT trigger_cutover_now FROM cutover_control \
-    WHERE config_id = $CONFIG_ID LIMIT 1;")
-CUTOVER_TRIGGER_NOW_AT=$(db_scalar "SELECT trigger_cutover_now_at FROM cutover_control \
-    WHERE config_id = $CONFIG_ID LIMIT 1;")
-
-if [[ -z "$CUTOVER_SCHEDULED_AT" ]]; then
-    log "ERROR: No cutover date/time configured in cutover_control for config_id=$CONFIG_ID"
-    db_log_error "Cutover control missing scheduled_cutover_at in cutover_control; exiting" "" "" ""
-    exit 1
-fi
-
-if [[ "$CUTOVER_STATUS" == "CUTOVER_COMPLETE" ]]; then
-    log "Cutover already completed for this migration (cutover_status=CUTOVER_COMPLETE) — exiting"
-    db_log_info "Cutover already complete; skipping further processing" "" "" ""
-    trap - EXIT
-    exit 0
-fi
-
-log "Cutover schedule from DB: scheduled_cutover_at=$CUTOVER_SCHEDULED_AT status=${CUTOVER_STATUS:-UNKNOWN} trigger_cutover_now=${CUTOVER_TRIGGER_NOW:-0}"
-
-############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
 ############################################
 section "FAILOVER RESUME CHECK"
@@ -1236,39 +1207,9 @@ if grep -q "not closed properly" "$SQL_FILE"; then
 fi
 
 ############################################
-# CUTOVER / ACTIVE BINLOG STATUS SYNC
+# ACTIVE BINLOG STATUS SYNC
 ############################################
-section "CUTOVER STATUS SYNC"
-
-CUTOVER_EFFECTIVE=0
-SCHEDULED_EPOCH=$(date -d "$CUTOVER_SCHEDULED_AT" +%s 2>/dev/null || true)
-NOW_EPOCH=$(date +%s)
-
-if [[ -z "$SCHEDULED_EPOCH" ]]; then
-    log "ERROR: Invalid scheduled_cutover_at format in cutover_control: '$CUTOVER_SCHEDULED_AT'"
-    db_log_error "Invalid cutover schedule format in cutover_control: $CUTOVER_SCHEDULED_AT" "$CURRENT_BINLOG" "$CURRENT_POS" ""
-    trap - EXIT
-    exit 1
-fi
-
-if [[ "$NOW_EPOCH" -ge "$SCHEDULED_EPOCH" ]]; then
-    CUTOVER_EFFECTIVE=1
-fi
-
-TRIGGER_DATE_MATCH=0
-if [[ "${CUTOVER_TRIGGER_NOW:-0}" =~ ^(1|TRUE|true)$ && -n "${CUTOVER_TRIGGER_NOW_AT:-}" ]]; then
-    SCHEDULED_DATE=$(date -d "$CUTOVER_SCHEDULED_AT" +%F 2>/dev/null || true)
-    TRIGGER_DATE=$(date -d "$CUTOVER_TRIGGER_NOW_AT" +%F 2>/dev/null || true)
-    if [[ -n "$SCHEDULED_DATE" && -n "$TRIGGER_DATE" && "$SCHEDULED_DATE" == "$TRIGGER_DATE" ]]; then
-        TRIGGER_DATE_MATCH=1
-        CUTOVER_EFFECTIVE=1
-    fi
-fi
-
-if [[ "${CUTOVER_TRIGGER_NOW:-0}" =~ ^(1|TRUE|true)$ && "$TRIGGER_DATE_MATCH" -ne 1 ]]; then
-    log "WARNING: trigger_cutover_now is set but trigger_cutover_now_at date does not match scheduled_cutover_at date; ignoring manual trigger"
-    db_log_warn "Ignored trigger_cutover_now because trigger date does not match scheduled cutover date" "$CURRENT_BINLOG" "$CURRENT_POS" ""
-fi
+section "ACTIVE BINLOG STATUS SYNC"
 
 if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
     db_query "UPDATE migration_status SET \
@@ -1276,23 +1217,7 @@ if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
         last_processed_timestamp = NOW() \
         WHERE config_id = $CONFIG_ID;" \
         || log "WARNING: Failed to update migration_status to ACTIVE_BINLOG_REACHED"
-
-    if [[ "$CUTOVER_EFFECTIVE" -eq 1 ]]; then
-        db_query "UPDATE cutover_control SET \
-            cutover_status = 'CUTOVER_READY', \
-            cutover_ready_at = COALESCE(cutover_ready_at, NOW()) \
-            WHERE config_id = $CONFIG_ID \
-              AND cutover_status IN ('CUTOVER_PENDING','CUTOVER_READY');" \
-            || log "WARNING: Failed to update cutover_control to CUTOVER_READY"
-        log "Cutover status set to CUTOVER_READY (active binlog reached and cutover is effective)"
-    else
-        db_query "UPDATE cutover_control SET \
-            cutover_status = 'CUTOVER_PENDING' \
-            WHERE config_id = $CONFIG_ID \
-              AND cutover_status IN ('CUTOVER_PENDING','CUTOVER_READY');" \
-            || log "WARNING: Failed to keep cutover_control at CUTOVER_PENDING"
-        log "Active binlog reached before effective cutover window — keeping cutover status at CUTOVER_PENDING"
-    fi
+    log "Migration status set to ACTIVE_BINLOG_REACHED (binlog still in use)"
 else
     db_query "UPDATE migration_status SET \
         processing_status = 'RUNNING', \
@@ -1300,15 +1225,6 @@ else
         WHERE config_id = $CONFIG_ID \
           AND processing_status = 'ACTIVE_BINLOG_REACHED';" \
         || log "WARNING: Failed to update migration_status back to RUNNING"
-
-    if [[ "$CUTOVER_EFFECTIVE" -eq 0 ]]; then
-        db_query "UPDATE cutover_control SET \
-            cutover_status = 'CUTOVER_PENDING' \
-            WHERE config_id = $CONFIG_ID \
-              AND cutover_status = 'CUTOVER_READY';" \
-            || log "WARNING: Failed to revert cutover_control from CUTOVER_READY to CUTOVER_PENDING"
-        log "Binlog is not active and cutover is not effective — cutover status reverted/kept as CUTOVER_PENDING"
-    fi
 fi
 
 ############################################
