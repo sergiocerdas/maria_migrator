@@ -290,6 +290,133 @@ db_log_critical() {
 }
 
 ############################################
+# BLOCKING CONDITIONS CHECK
+############################################
+# Checks for unresolved error conditions that require manual intervention
+# before processing can continue. This prevents applying binlogs when:
+#   1. There are ERROR entries in processing_log (newer than last acknowledgment)
+#   2. There are non-COMPLETED checkpoints (STARTED, FAILED, INTERRUPTED)
+#
+# Returns: 0 if OK to proceed, 1 if blocked
+############################################
+check_blocking_conditions() {
+    local error_ack_timestamp
+    local error_count
+    local checkpoint_count
+    local blocked=0
+    
+    log "Checking for blocking error conditions..."
+    
+    # Get the last error acknowledgment timestamp (NULL means never acknowledged)
+    error_ack_timestamp=$(db_scalar "SELECT COALESCE(error_acknowledged_at, '1970-01-01 00:00:00') 
+        FROM migration_status WHERE config_id = $CONFIG_ID;")
+    
+    if [[ -z "$error_ack_timestamp" ]]; then
+        # No migration_status record yet - this is a fresh start, no blocking conditions
+        log "No migration_status record found - fresh start, no blocking conditions"
+        return 0
+    fi
+    
+    # Check 1: ERROR entries in processing_log newer than last acknowledgment
+    error_count=$(db_scalar "SELECT COUNT(*) FROM processing_log 
+        WHERE config_id = $CONFIG_ID 
+          AND log_level = 'ERROR' 
+          AND logged_at > '$error_ack_timestamp';")
+    
+    if [[ "$error_count" -gt 0 ]]; then
+        blocked=1
+        log ""
+        log "============================================================"
+        log "BLOCKING CONDITION: $error_count unacknowledged ERROR(s) in processing_log"
+        log "============================================================"
+        log ""
+        log "Recent ERROR entries:"
+        
+        # Show the most recent errors
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL "$DB_NAME" --table \
+              -e "SELECT log_id, logged_at, log_message, binlog_file, binlog_position 
+                  FROM processing_log 
+                  WHERE config_id = $CONFIG_ID 
+                    AND log_level = 'ERROR' 
+                    AND logged_at > '$error_ack_timestamp'
+                  ORDER BY logged_at DESC 
+                  LIMIT 5;" 2>/dev/null | tee -a "$LOG_FILE"
+        
+        log ""
+    fi
+    
+    # Check 2: Non-COMPLETED checkpoints (STARTED, FAILED, INTERRUPTED)
+    checkpoint_count=$(db_scalar "SELECT COUNT(*) FROM binlog_apply_checkpoints 
+        WHERE config_id = $CONFIG_ID 
+          AND apply_status IN ('STARTED', 'FAILED', 'INTERRUPTED');")
+    
+    if [[ "$checkpoint_count" -gt 0 ]]; then
+        blocked=1
+        log ""
+        log "============================================================"
+        log "BLOCKING CONDITION: $checkpoint_count incomplete checkpoint(s) in binlog_apply_checkpoints"
+        log "============================================================"
+        log ""
+        log "Incomplete checkpoints (recovery points for flashback):"
+        
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL "$DB_NAME" --table \
+              -e "SELECT checkpoint_id, source_binlog_file, source_binlog_position,
+                         apply_status, apply_started_at, 
+                         target_binlog_file_before, target_binlog_position_before,
+                         error_message
+                  FROM binlog_apply_checkpoints 
+                  WHERE config_id = $CONFIG_ID 
+                    AND apply_status IN ('STARTED', 'FAILED', 'INTERRUPTED')
+                  ORDER BY checkpoint_id DESC;" 2>/dev/null | tee -a "$LOG_FILE"
+        
+        log ""
+    fi
+    
+    if [[ $blocked -eq 1 ]]; then
+        log "============================================================"
+        log "MANUAL INTERVENTION REQUIRED"
+        log "============================================================"
+        log ""
+        log "NOTE: Before determining an actual error condition occurred, verify that the"
+        log "process is not actively applying binlogs on the current primary that is"
+        log "a different server other than the local one. If so, ignore this manual"
+        log "intervention requirement and let the next iteration run as expected."
+        log ""
+        log "Processing is BLOCKED due to the above condition(s)."
+        log "Review the errors and take corrective action before continuing."
+        log ""
+        log "To acknowledge errors and unblock processing, run:"
+        log ""
+        log "  UPDATE migration_status"
+        log "  SET error_acknowledged_at = NOW()"
+        log "  WHERE config_id = $CONFIG_ID;"
+        log ""
+        log "If there are incomplete checkpoints, you must ALSO either:"
+        log "  1. Verify target data integrity and mark as COMPLETED:"
+        log "     UPDATE binlog_apply_checkpoints"
+        log "     SET apply_status = 'COMPLETED', apply_completed_at = NOW(),"
+        log "         error_message = 'Manually verified by operator'"
+        log "     WHERE config_id = $CONFIG_ID AND apply_status != 'COMPLETED';"
+        log ""
+        log "  OR"
+        log ""
+        log "  2. Perform flashback recovery using target_binlog_file_before"
+        log "     and target_binlog_position_before from the checkpoint record."
+        log ""
+        log "============================================================"
+        
+        db_log_warn "Processing blocked: $error_count unacknowledged error(s), $checkpoint_count incomplete checkpoint(s). Manual intervention required." "" "" ""
+        
+        return 1
+    fi
+    
+    log "No blocking conditions found - OK to proceed"
+    return 0
+}
+
+############################################
 # BINLOG APPLY FUNCTION
 ############################################
 
@@ -779,6 +906,23 @@ fi
 log "Using CONFIG_ID=$CONFIG_ID  CURRENT_NODE_ID=$CURRENT_NODE_ID"
 
 ############################################
+# PAUSE CHECK
+############################################
+section "PAUSE CHECK"
+
+IS_PAUSED=$(db_scalar "SELECT is_paused FROM migration_config \
+    WHERE config_id = $CONFIG_ID LIMIT 1;")
+
+if [[ "$IS_PAUSED" == "1" ]]; then
+    log "Migration is paused (is_paused=1 in migration_config) — skipping this iteration"
+    db_log_info "Skipping iteration: migration is paused" "" "" ""
+    trap - EXIT
+    exit 0
+fi
+
+log "Migration is not paused — continuing"
+
+############################################
 # CUTOVER CONTROL CHECK
 ############################################
 section "CUTOVER CONTROL CHECK"
@@ -993,6 +1137,27 @@ if [[ -z "${CURRENT_PROCESSING_SERVER_ID:-}" ]]; then
     log "ERROR: current_processing_server_id is not set in migration_status"
     exit 1
 fi
+
+############################################
+# CHECK FOR BLOCKING CONDITIONS
+############################################
+# Before processing, check if there are unresolved errors from a previous run
+# that require manual intervention (ERROR logs or incomplete checkpoints)
+# This check runs on ALL nodes (primary and secondary) so that alerts
+# are visible regardless of which node the service runs on
+############################################
+
+if ! check_blocking_conditions; then
+    log "Exiting due to blocking conditions - manual intervention required"
+    trap - EXIT
+    exit 0
+fi
+
+############################################
+# NON-PROCESSING SERVER CHECK
+############################################
+# After confirming no blocking errors, check if this node should process
+############################################
 
 if [[ "$LOCAL_SERVER_ID" != "$CURRENT_PROCESSING_SERVER_ID" ]]; then
     log "This node is not the current processing server (local_server_id=$LOCAL_SERVER_ID, current_processing_server_id=$CURRENT_PROCESSING_SERVER_ID)"

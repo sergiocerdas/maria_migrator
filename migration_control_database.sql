@@ -50,6 +50,20 @@ CREATE TABLE migration_config (
     INDEX idx_target_instance (target_instance_name)
 );
 
+-- ============================================================================
+-- OPERATOR COMMAND: Pause/Unpause migration processing
+-- ============================================================================
+-- When is_paused = TRUE, the migration script will skip processing on each
+-- scheduled iteration. The script exits cleanly without applying any binlogs.
+-- Use this for temporary maintenance windows or to safely halt replication.
+--
+-- To PAUSE a migration:
+--   UPDATE migration_config SET is_paused = TRUE WHERE config_id = <CONFIG_ID>;
+--
+-- To UNPAUSE and resume processing:
+--   UPDATE migration_config SET is_paused = FALSE WHERE config_id = <CONFIG_ID>;
+-- ============================================================================
+
 -- Maps source instances to their cluster nodes
 CREATE TABLE source_cluster_mapping (
     mapping_id INT AUTO_INCREMENT PRIMARY KEY,
@@ -100,6 +114,11 @@ CREATE TABLE migration_status (
     total_transactions_processed BIGINT DEFAULT 0,
     total_maintenance_operations_ignored INT DEFAULT 0,
     
+    -- Error acknowledgment tracking
+    -- When NULL, any ERROR logs or non-COMPLETED checkpoints will block processing
+    -- Update this timestamp to acknowledge errors and allow processing to continue
+    error_acknowledged_at TIMESTAMP NULL,
+    
     -- Metadata
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
@@ -112,6 +131,36 @@ CREATE TABLE migration_status (
     INDEX idx_processing_node (current_processing_node_id),
     INDEX idx_processing_status (processing_status)
 );
+
+-- ============================================================================
+-- OPERATOR COMMAND: Acknowledge errors and unblock processing
+-- ============================================================================
+-- The migration script will BLOCK if it detects:
+--   1. ERROR entries in processing_log (newer than last acknowledgment)
+--   2. Non-COMPLETED entries in binlog_apply_checkpoints (STARTED, FAILED, INTERRUPTED)
+--
+-- Before acknowledging, you MUST:
+--   1. Review the error conditions in processing_log and binlog_apply_checkpoints
+--   2. If a binlog apply was interrupted, either:
+--      a) Verify target data integrity and mark checkpoint COMPLETED, OR
+--      b) Perform flashback recovery using checkpoint's target_binlog_file_before
+--   3. Fix the root cause of the error
+--
+-- To acknowledge errors and allow processing to continue:
+--
+--   UPDATE migration_status 
+--   SET error_acknowledged_at = NOW() 
+--   WHERE config_id = <CONFIG_ID>;
+--
+-- To also clear incomplete checkpoints (ONLY after verifying/recovering target data):
+--
+--   UPDATE binlog_apply_checkpoints 
+--   SET apply_status = 'COMPLETED', 
+--       apply_completed_at = NOW(),
+--       error_message = 'Manually verified and cleared by operator'
+--   WHERE config_id = <CONFIG_ID> 
+--     AND apply_status IN ('STARTED', 'FAILED', 'INTERRUPTED');
+-- ============================================================================
 
 -- Cutover control and state machine (separate from migration_status)
 CREATE TABLE cutover_control (
@@ -292,34 +341,177 @@ CREATE TABLE binlog_apply_checkpoints (
 
 -- ============================================================================
 -- RECOVERY PROCEDURE: Point-in-Time Recovery after failed/interrupted apply
+-- (Cluster-Aware for Galera/MariaDB Cluster target instances)
 -- ============================================================================
--- If a binlog apply fails or is interrupted, use the checkpoint data to recover:
+-- If a binlog apply fails or is interrupted, use the checkpoint data to recover.
+-- IMPORTANT: The target is a CLUSTERED instance - recovery must be coordinated
+-- across all cluster nodes to avoid split-brain and data inconsistency.
 --
--- 1. Find the failed/interrupted checkpoint:
---    SELECT * FROM binlog_apply_checkpoints 
---    WHERE apply_status IN ('FAILED', 'INTERRUPTED') 
---    ORDER BY checkpoint_id DESC LIMIT 1;
+-- STEP 0: PAUSE MIGRATION IMMEDIATELY
+-- ------------------------------------
+-- Prevent further processing while recovery is in progress:
 --
--- 2. Use the target_binlog_file_before and target_binlog_position_before 
---    to perform point-in-time recovery on the TARGET database:
+--   UPDATE migration_config SET is_paused = TRUE WHERE config_id = <CONFIG_ID>;
 --
---    Option A: Using mariabackup flashback (if available):
---      mariabackup --prepare --target-dir=/backup/path \
---        --apply-log-only \
---        --binlog-info=<target_binlog_file_before>,<target_binlog_position_before>
+-- STEP 1: IDENTIFY THE FAILED CHECKPOINT
+-- --------------------------------------
+-- Find the failed/interrupted checkpoint:
 --
---    Option B: Using mysqlbinlog to revert (if binlog still available):
---      mysqlbinlog --start-position=<target_binlog_position_before> \
---        /var/lib/mysql/<target_binlog_file_before> | mysql
+--   SELECT checkpoint_id, source_binlog_file, source_binlog_position,
+--          target_binlog_file_before, target_binlog_position_before,
+--          target_gtid_before, apply_status, error_message
+--   FROM binlog_apply_checkpoints 
+--   WHERE config_id = <CONFIG_ID>
+--     AND apply_status IN ('FAILED', 'INTERRUPTED') 
+--   ORDER BY checkpoint_id DESC LIMIT 1;
 --
---    Option C: Restore from backup + replay binlogs up to recovery point
+-- STEP 2: STOP APPLICATION TRAFFIC TO TARGET CLUSTER
+-- --------------------------------------------------
+-- Before recovery, ensure no writes are occurring on the target cluster:
 --
--- 3. After recovery, update migration_status to resume from the failed binlog:
---    UPDATE migration_status SET 
---      current_binlog_file = '<source_binlog_file>',
---      current_binlog_position = <source_binlog_position>,
---      processing_status = 'RUNNING'
---    WHERE config_id = <config_id>;
+--   a) Update VIP/load balancer to stop routing traffic to target
+--   b) On target PRIMARY node, verify no active connections:
+--      SHOW PROCESSLIST;
+--   c) Optionally set read_only on all nodes:
+--      SET GLOBAL read_only = ON;
+--
+-- STEP 3: ISOLATE PRIMARY NODE FOR RECOVERY (Galera Cluster)
+-- ----------------------------------------------------------
+-- For Galera clusters, you must desync the primary before recovery:
+--
+--   -- On the PRIMARY node only:
+--   SET GLOBAL wsrep_desync = ON;
+--   SET GLOBAL wsrep_on = OFF;
+--
+-- This prevents the recovery operations from replicating to other nodes
+-- (which would corrupt their state since they already have the bad data).
+--
+-- STEP 4: PERFORM POINT-IN-TIME RECOVERY ON PRIMARY
+-- -------------------------------------------------
+-- Use the target_binlog_file_before and target_binlog_position_before 
+-- to roll back to the consistent state BEFORE the failed apply:
+--
+--   Option A: Using mariadb-binlog with rollback (if available):
+--     # Generate reverse SQL from target's own binlogs
+--     mariadb-binlog --start-position=<target_binlog_position_before> \
+--       --to-last-log \
+--       /var/lib/mysql/<target_binlog_file_before> \
+--       | mariadb -u root
+--
+--   Option B: Restore from backup + replay binlogs to recovery point:
+--     # 1. Restore latest full backup
+--     mariabackup --prepare --target-dir=/backup/full
+--     mariabackup --copy-back --target-dir=/backup/full
+--     
+--     # 2. Replay binlogs up to (but not including) the failed position
+--     mariadb-binlog /var/lib/mysql/binlog.* \
+--       --stop-position=<target_binlog_position_before> \
+--       | mariadb -u root
+--
+--   Option C: Using GTID-based flashback (if target_gtid_before is available):
+--     # Identify transactions to roll back
+--     mariadb-binlog --start-position=<target_binlog_position_before> \
+--       --base64-output=decode-rows -v \
+--       /var/lib/mysql/<target_binlog_file_before>
+--     
+--     # Manually construct reverse DML or use third-party flashback tools
+--
+-- STEP 5: VERIFY RECOVERY ON PRIMARY
+-- ----------------------------------
+-- Confirm the primary is at the expected recovery point:
+--
+--   SHOW MASTER STATUS;
+--   -- Should show position <= target_binlog_position_before
+--
+--   SELECT @@gtid_current_pos;
+--   -- Should match or precede target_gtid_before
+--
+-- STEP 6: RE-SYNC SECONDARY NODES (Galera Cluster)
+-- ------------------------------------------------
+-- Secondary nodes have inconsistent data. You must rebuild them from primary:
+--
+--   Option A: Full SST (State Snapshot Transfer) - RECOMMENDED
+--   -----------------------------------------------------------
+--   On EACH SECONDARY node:
+--
+--     # 1. Stop MariaDB
+--     systemctl stop mariadb
+--
+--     # 2. Remove data directory (backup first if needed)
+--     rm -rf /var/lib/mysql/*
+--
+--     # 3. Restart - will trigger full SST from donor (primary)
+--     systemctl start mariadb
+--
+--     # 4. Monitor SST progress
+--     tail -f /var/log/mysql/error.log
+--
+--   Option B: Incremental State Transfer (IST) - if gcache has required data
+--   -------------------------------------------------------------------------
+--   Only works if the gcache on primary contains all transactions since
+--   the secondary's last known position. Usually NOT viable after recovery.
+--
+-- STEP 7: RE-ENABLE CLUSTER REPLICATION ON PRIMARY
+-- ------------------------------------------------
+-- After all secondaries have rejoined and are synced:
+--
+--   -- On PRIMARY node:
+--   SET GLOBAL wsrep_on = ON;
+--   SET GLOBAL wsrep_desync = OFF;
+--
+--   -- Verify cluster is healthy:
+--   SHOW STATUS LIKE 'wsrep_cluster_size';
+--   SHOW STATUS LIKE 'wsrep_cluster_status';   -- Should be 'Primary'
+--   SHOW STATUS LIKE 'wsrep_local_state_comment';  -- Should be 'Synced'
+--
+-- STEP 8: UPDATE MIGRATION STATE
+-- ------------------------------
+-- Reset migration to resume from the failed binlog:
+--
+--   UPDATE migration_status SET 
+--     current_binlog_file = '<source_binlog_file>',
+--     current_binlog_position = <source_binlog_position>,
+--     processing_status = 'STOPPED'
+--   WHERE config_id = <CONFIG_ID>;
+--
+--   -- Mark the failed checkpoint as manually resolved
+--   UPDATE binlog_apply_checkpoints 
+--   SET apply_status = 'COMPLETED',
+--       apply_completed_at = NOW(),
+--       error_message = 'Manually recovered via cluster PITR procedure'
+--   WHERE checkpoint_id = <CHECKPOINT_ID>;
+--
+-- STEP 9: RE-ENABLE APPLICATION TRAFFIC
+-- -------------------------------------
+--   a) Disable read_only on target nodes:
+--      SET GLOBAL read_only = OFF;
+--   b) Update VIP/load balancer to resume traffic routing
+--
+-- STEP 10: UNPAUSE MIGRATION
+-- --------------------------
+-- Resume migration processing:
+--
+--   UPDATE migration_config SET is_paused = FALSE WHERE config_id = <CONFIG_ID>;
+--
+-- ============================================================================
+-- NOTES FOR DIFFERENT CLUSTER TYPES:
+-- ============================================================================
+--
+-- MariaDB Galera Cluster:
+--   - Uses wsrep_desync/wsrep_on as described above
+--   - SST methods: rsync, mariabackup, xtrabackup
+--   - gcache contains recent transactions for IST
+--
+-- MySQL InnoDB Cluster (Group Replication):
+--   - Use SET GLOBAL group_replication_exit_state_action = 'OFFLINE_MODE';
+--   - Recovery node: STOP GROUP_REPLICATION; <recover> START GROUP_REPLICATION;
+--   - Clone plugin may auto-rebuild secondaries
+--
+-- Standard Async Replication:
+--   - Stop slave on all replicas: STOP SLAVE;
+--   - Recover master, then CHANGE MASTER TO on each replica
+--   - May need to use MASTER_AUTO_POSITION=1 with GTID
+--
 -- ============================================================================
 
 -- Function to encrypt passwords (simple AES encryption)
@@ -358,101 +550,3 @@ BEGIN
 END//
 
 DELIMITER ;
-
-
--- Insert cluster nodes
-/*
-
-INSERT INTO cluster_nodes (node_name, server_hostname, server_ip) VALUES
-('mariadb-node1', 'mariadb-cluster-01.example.com', '10.0.1.10'),
-('mariadb-node2', 'mariadb-cluster-02.example.com', '10.0.1.11');
-
--- Insert migration configuration
-INSERT INTO migration_config (
-    migration_name, 
-    source_instance_name, 
-    source_local_port, 
-    source_vip_port,
-    source_cluster_id,
-    target_instance_name, 
-    target_port, 
-    target_host,
-    binlog_local_path,
-    migration_username, 
-    migration_password_encrypted
-) VALUES (
-    'prod_to_analytics',
-    'mariadb-prod-cluster',
-    3306,
-    3307,
-    1,
-    'analytics-db',
-    3306,
-    'analytics-server.example.com',
-    '/var/lib/mysql',
-    'migration_user',
-    encrypt_password('secure_password_123', 'your_encryption_key_here')
-);
-
--- Map cluster nodes to the migration
-INSERT INTO source_cluster_mapping (config_id, node_id, server_id, is_primary, priority_order) VALUES
-(1, 1, 1, TRUE, 1),   -- Node 1 is primary with server_id 1
-(1, 2, 2, FALSE, 2);  -- Node 2 is secondary with server_id 2
-
--- Initialize migration status
-INSERT INTO migration_status (
-    config_id,
-    current_processing_node_id,
-    current_processing_server_id,
-    current_binlog_file,
-    current_binlog_position,
-    processing_status,
-    process_hostname
-) VALUES (
-    1,
-    1,  -- Starting with node 1
-    1,  -- Server ID 1
-    'mysql-bin.000001',
-    0,
-    'STOPPED',
-    'migration-server-01'
-);
-
-
-*/
-
--- ============================================================================
--- UPGRADE SCRIPT: Add binlog_apply_checkpoints table to existing deployments
--- ============================================================================
--- Run this if you have an existing control database that was created before
--- the checkpoint feature was added:
---
--- USE mariaDBaaS_migcontrol;
--- 
--- CREATE TABLE IF NOT EXISTS binlog_apply_checkpoints (
---     checkpoint_id BIGINT AUTO_INCREMENT PRIMARY KEY,
---     config_id INT NOT NULL,
---     source_binlog_file VARCHAR(255) NOT NULL,
---     source_binlog_position BIGINT UNSIGNED NOT NULL,
---     target_binlog_file_before VARCHAR(255) NOT NULL,
---     target_binlog_position_before BIGINT UNSIGNED NOT NULL,
---     target_gtid_before VARCHAR(500),
---     target_binlog_file_after VARCHAR(255),
---     target_binlog_position_after BIGINT UNSIGNED,
---     target_gtid_after VARCHAR(500),
---     apply_status ENUM('STARTED', 'COMPLETED', 'FAILED', 'INTERRUPTED') DEFAULT 'STARTED',
---     apply_started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
---     apply_completed_at TIMESTAMP NULL,
---     error_message TEXT,
---     error_code INT,
---     process_pid INT,
---     process_hostname VARCHAR(255),
---     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
---     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
---     FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
---     INDEX idx_config_source_binlog (config_id, source_binlog_file),
---     INDEX idx_apply_status (apply_status),
---     INDEX idx_apply_started (apply_started_at),
---     INDEX idx_target_binlog (target_binlog_file_before, target_binlog_position_before)
--- ) ENGINE=InnoDB;
--- ============================================================================
