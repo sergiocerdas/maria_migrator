@@ -58,10 +58,10 @@ CREATE TABLE migration_config (
 -- Use this for temporary maintenance windows or to safely halt replication.
 --
 -- To PAUSE a migration:
---   UPDATE migration_config SET is_paused = TRUE WHERE config_id = <CONFIG_ID>;
+--   UPDATE migration_config SET is_paused = TRUE, is_active = FALSE WHERE config_id = <CONFIG_ID>;
 --
 -- To UNPAUSE and resume processing:
---   UPDATE migration_config SET is_paused = FALSE WHERE config_id = <CONFIG_ID>;
+--   UPDATE migration_config SET is_paused = FALSE, is_active = TRUE WHERE config_id = <CONFIG_ID>;
 -- ============================================================================
 
 -- Maps source instances to their cluster nodes
@@ -293,7 +293,7 @@ CREATE TABLE binlog_apply_checkpoints (
 -- ------------------------------------
 -- Prevent further processing while recovery is in progress:
 --
---   UPDATE migration_config SET is_paused = TRUE WHERE config_id = <CONFIG_ID>;
+--   UPDATE migration_config SET is_paused = TRUE, is_active = FALSE WHERE config_id = <CONFIG_ID>;
 --
 -- STEP 1: IDENTIFY THE FAILED CHECKPOINT
 -- --------------------------------------
