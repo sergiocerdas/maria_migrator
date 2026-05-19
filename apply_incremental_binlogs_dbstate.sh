@@ -923,6 +923,81 @@ fi
 log "Migration is not paused — continuing"
 
 ############################################
+# MAINTENANCE WINDOW CHECK
+############################################
+section "MAINTENANCE WINDOW CHECK"
+
+# Check if currently in a maintenance window (config-specific or global)
+# Supports schedule types: WEEKLY, MONTHLY_DAY, MONTHLY_WEEKDAY, SPECIFIC_DATE
+#
+# Variables used in SQL:
+#   v_dow: day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+#   v_dom: day of month (1-31)
+#   v_wom: week of month (1-5, which occurrence of this weekday)
+#   v_is_last: 1 if this is the last occurrence of this weekday in the month
+#   v_date: current date
+#
+IN_MAINTENANCE=$(db_scalar "
+    SELECT EXISTS (
+        SELECT 1 FROM maintenance_windows mw,
+        (SELECT 
+            DAYOFWEEK(NOW()) - 1 AS v_dow,
+            DAY(CURDATE()) AS v_dom,
+            CEIL(DAY(CURDATE()) / 7) AS v_wom,
+            CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
+            CURDATE() AS v_date
+        ) vars
+        WHERE mw.is_active = TRUE
+          AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
+          AND CURTIME() BETWEEN mw.start_time AND mw.end_time
+          AND (
+              -- WEEKLY: matches day of week
+              (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
+              -- MONTHLY_DAY: matches day of month (1-31)
+              OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
+              -- MONTHLY_WEEKDAY: matches Nth weekday (1-4) or last weekday (5)
+              OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                  AND mw.day_of_week = vars.v_dow
+                  AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
+              -- SPECIFIC_DATE: matches exact date
+              OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
+          )
+    ) AS in_window;")
+
+if [[ "$IN_MAINTENANCE" == "1" ]]; then
+    # Get window details for logging
+    WINDOW_INFO=$(db_scalar "
+        SELECT CONCAT(mw.window_name, ' (', mw.schedule_type, ')') 
+        FROM maintenance_windows mw,
+        (SELECT 
+            DAYOFWEEK(NOW()) - 1 AS v_dow,
+            DAY(CURDATE()) AS v_dom,
+            CEIL(DAY(CURDATE()) / 7) AS v_wom,
+            CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
+            CURDATE() AS v_date
+        ) vars
+        WHERE mw.is_active = TRUE
+          AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
+          AND CURTIME() BETWEEN mw.start_time AND mw.end_time
+          AND (
+              (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
+              OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
+              OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                  AND mw.day_of_week = vars.v_dow
+                  AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
+              OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
+          )
+        LIMIT 1;")
+    
+    log "Currently in maintenance window: '$WINDOW_INFO' — skipping this iteration"
+    db_log_info "Skipping iteration: in maintenance window '$WINDOW_INFO'" "" "" ""
+    trap - EXIT
+    exit 0
+fi
+
+log "Not in maintenance window — continuing"
+
+############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
 ############################################
 section "FAILOVER RESUME CHECK"

@@ -84,6 +84,132 @@ CREATE TABLE source_cluster_mapping (
     INDEX idx_server_id (server_id)
 );
 
+-- Maintenance windows for scheduled downtime (e.g., patching)
+-- Migration processing will skip iterations during these windows
+-- Supports: weekly recurring, monthly recurring (by day or weekday), and one-time specific dates
+CREATE TABLE maintenance_windows (
+    window_id INT AUTO_INCREMENT PRIMARY KEY,
+    config_id INT NULL, -- NULL = applies to ALL migrations (global window)
+    
+    -- Schedule type determines which fields are used
+    schedule_type ENUM('WEEKLY', 'MONTHLY_DAY', 'MONTHLY_WEEKDAY', 'SPECIFIC_DATE') DEFAULT 'WEEKLY',
+    
+    -- For WEEKLY: day_of_week (0-6)
+    -- For MONTHLY_WEEKDAY: day_of_week (0-6) + week_of_month (1-5)
+    day_of_week TINYINT NULL, -- 0=Sunday, 1=Monday, ..., 6=Saturday
+    
+    -- For MONTHLY_DAY: day_of_month (1-31)
+    day_of_month TINYINT NULL, -- 1-31; if day doesn't exist in month, window is skipped
+    
+    -- For MONTHLY_WEEKDAY: week_of_month (1=first, 2=second, 3=third, 4=fourth, 5=last)
+    week_of_month TINYINT NULL, -- 1-5 (5 = last occurrence of that weekday)
+    
+    -- For SPECIFIC_DATE: one-time window on exact date
+    specific_date DATE NULL,
+    
+    -- Time range (applies to all schedule types)
+    start_time TIME NOT NULL,
+    end_time TIME NOT NULL,
+    
+    -- Window metadata
+    window_name VARCHAR(100) NOT NULL,
+    description TEXT,
+    is_active BOOLEAN DEFAULT TRUE,
+    
+    -- Audit
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_by VARCHAR(100) DEFAULT USER(),
+    
+    FOREIGN KEY (config_id) REFERENCES migration_config(config_id) ON DELETE CASCADE,
+    
+    INDEX idx_config_id (config_id),
+    INDEX idx_schedule_type (schedule_type),
+    INDEX idx_day_time (day_of_week, start_time, end_time),
+    INDEX idx_specific_date (specific_date),
+    INDEX idx_is_active (is_active)
+);
+
+-- ============================================================================
+-- OPERATOR COMMAND: Manage maintenance windows
+-- ============================================================================
+-- Maintenance windows define time periods where migration processing will be
+-- skipped. Supports weekly, monthly, and one-time schedules.
+--
+-- SCHEDULE TYPES:
+--   WEEKLY         - Repeats every week on specified day_of_week
+--   MONTHLY_DAY    - Repeats monthly on specified day_of_month (1-31)
+--   MONTHLY_WEEKDAY- Repeats monthly on Nth weekday (e.g., 2nd Tuesday)
+--   SPECIFIC_DATE  - One-time window on exact date
+--
+-- DAY MAPPINGS:
+--   day_of_week:  0=Sunday, 1=Monday, 2=Tuesday, 3=Wednesday, 4=Thursday, 5=Friday, 6=Saturday
+--   week_of_month: 1=first, 2=second, 3=third, 4=fourth, 5=last
+--   day_of_month: 1-31 (if day doesn't exist, window is skipped that month)
+--
+-- ============================================================================
+-- EXAMPLES:
+-- ============================================================================
+--
+-- WEEKLY: Every Tuesday 2-6 AM (config-specific):
+--   INSERT INTO maintenance_windows 
+--     (config_id, schedule_type, day_of_week, start_time, end_time, window_name)
+--   VALUES (1, 'WEEKLY', 2, '02:00:00', '06:00:00', 'Weekly Tuesday Patching');
+--
+-- WEEKLY: Every Sunday 3-5 AM (GLOBAL - applies to ALL migrations):
+--   INSERT INTO maintenance_windows 
+--     (config_id, schedule_type, day_of_week, start_time, end_time, window_name)
+--   VALUES (NULL, 'WEEKLY', 0, '03:00:00', '05:00:00', 'Sunday Global Maintenance');
+--
+-- WEEKLY window spanning midnight (Tuesday 5 PM to Wednesday 8:30 AM):
+--   INSERT INTO maintenance_windows (config_id, schedule_type, day_of_week, start_time, end_time, window_name) VALUES
+--   (NULL, 'WEEKLY', 2, '17:00:00', '23:59:59', 'Weekly Patching - Tuesday Evening'),
+--   (NULL, 'WEEKLY', 3, '00:00:00', '08:30:00', 'Weekly Patching - Wednesday Morning');
+--
+-- MONTHLY_DAY: 15th of every month, 1-5 AM (GLOBAL):
+--   INSERT INTO maintenance_windows 
+--     (config_id, schedule_type, day_of_month, start_time, end_time, window_name)
+--   VALUES (NULL, 'MONTHLY_DAY', 15, '01:00:00', '05:00:00', 'Monthly Mid-Month Patching');
+--
+-- MONTHLY_WEEKDAY: 2nd Tuesday of every month, 2-6 AM (GLOBAL):
+--   INSERT INTO maintenance_windows 
+--     (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name)
+--   VALUES (NULL, 'MONTHLY_WEEKDAY', 2, 2, '02:00:00', '06:00:00', 'Monthly 2nd Tuesday Patching');
+--
+-- MONTHLY_WEEKDAY: Last Friday of every month, 10 PM - 2 AM:
+--   INSERT INTO maintenance_windows (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name) VALUES
+--   (NULL, 'MONTHLY_WEEKDAY', 5, 5, '22:00:00', '23:59:59', 'Monthly Last Friday - Evening'),
+--   (NULL, 'MONTHLY_WEEKDAY', 6, 1, '00:00:00', '02:00:00', 'Monthly Last Friday - Next Morning');
+--
+-- SPECIFIC_DATE: One-time window on June 15, 2026, 1-5 AM:
+--   INSERT INTO maintenance_windows 
+--     (config_id, schedule_type, specific_date, start_time, end_time, window_name)
+--   VALUES (NULL, 'SPECIFIC_DATE', '2026-06-15', '01:00:00', '05:00:00', 'Q2 Infrastructure Upgrade');
+--
+-- ============================================================================
+-- MANAGEMENT COMMANDS:
+-- ============================================================================
+--
+-- DISABLE a window temporarily:
+--   UPDATE maintenance_windows SET is_active = FALSE WHERE window_id = <WINDOW_ID>;
+--
+-- RE-ENABLE a window:
+--   UPDATE maintenance_windows SET is_active = TRUE WHERE window_id = <WINDOW_ID>;
+--
+-- DELETE a window:
+--   DELETE FROM maintenance_windows WHERE window_id = <WINDOW_ID>;
+--
+-- VIEW all active windows:
+--   SELECT * FROM maintenance_windows WHERE is_active = TRUE;
+--
+-- CHECK if currently in maintenance (for config_id=1):
+--   CALL is_in_maintenance_window(1);
+--
+-- ============================================================================
+-- LEGACY COMPATIBILITY: Existing WEEKLY windows with day_of_week set will
+-- continue to work. schedule_type defaults to 'WEEKLY'.
+-- ============================================================================
+
 
 -- Current migration processing status
 CREATE TABLE migration_status (
@@ -334,11 +460,12 @@ CREATE TABLE binlog_apply_checkpoints (
 -- to roll back to the consistent state BEFORE the failed apply:
 --
 --   Option A: Using mariadb-binlog with rollback (if available):
---     # Generate reverse SQL from target's own binlogs
---     mariadb-binlog --start-position=<target_binlog_position_before> \
---       --to-last-log \
---       /var/lib/mysql/<target_binlog_file_before> \
---       | mariadb -u root
+--     # # Correct command for generating reverse SQL
+--     mariadb-binlog --flashback \
+--     --start-position=<target_binlog_position_before> \
+--     --to-last-log \
+--     /var/lib/mysql/<target_binlog_file_before> \
+--     | mariadb -u root
 --
 --   Option B: Restore from backup + replay binlogs to recovery point:
 --     # 1. Restore latest full backup
@@ -483,11 +610,355 @@ BEGIN
     TRUNCATE TABLE processing_log;
     TRUNCATE TABLE failover_events;
     TRUNCATE TABLE migration_status;
+    TRUNCATE TABLE maintenance_windows;
     TRUNCATE TABLE source_cluster_mapping;
     TRUNCATE TABLE migration_config;
     TRUNCATE TABLE cluster_nodes;
 
     SET FOREIGN_KEY_CHECKS = 1;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Check if currently in a maintenance window (simple boolean)
+-- ============================================================================
+-- Returns 1 if currently in a maintenance window, 0 if not
+-- Checks both config-specific windows and global windows (config_id IS NULL)
+-- Supports all schedule types: WEEKLY, MONTHLY_DAY, MONTHLY_WEEKDAY, SPECIFIC_DATE
+--
+-- Usage: CALL is_in_maintenance_window(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE is_in_maintenance_window(IN p_config_id INT)
+BEGIN
+    DECLARE v_current_dow TINYINT;           -- 0-6 (Sunday=0)
+    DECLARE v_current_dom TINYINT;           -- 1-31
+    DECLARE v_current_week_of_month TINYINT; -- Which occurrence of this weekday (1-5)
+    DECLARE v_is_last_of_month TINYINT;      -- Is this the last occurrence of this weekday?
+    DECLARE v_current_date DATE;
+    DECLARE v_days_in_month TINYINT;
+    
+    -- Calculate current date components
+    SET v_current_date = CURDATE();
+    SET v_current_dow = DAYOFWEEK(NOW()) - 1;  -- MySQL DAYOFWEEK is 1-7, we store 0-6
+    SET v_current_dom = DAY(v_current_date);
+    SET v_current_week_of_month = CEIL(v_current_dom / 7);  -- 1-5
+    SET v_days_in_month = DAY(LAST_DAY(v_current_date));
+    
+    -- Check if this is the LAST occurrence of this weekday in the month
+    -- (i.e., there's no same weekday in the next 7 days within this month)
+    SET v_is_last_of_month = CASE 
+        WHEN v_current_dom + 7 > v_days_in_month THEN 1 
+        ELSE 0 
+    END;
+    
+    SELECT EXISTS (
+        SELECT 1 FROM maintenance_windows mw
+        WHERE mw.is_active = TRUE
+          AND (mw.config_id = p_config_id OR mw.config_id IS NULL)
+          AND CURTIME() BETWEEN mw.start_time AND mw.end_time
+          AND (
+              -- WEEKLY: matches day of week
+              (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_current_dow)
+              -- MONTHLY_DAY: matches day of month
+              OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_current_dom)
+              -- MONTHLY_WEEKDAY: matches Nth weekday (1-4) or last weekday (5)
+              OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                  AND mw.day_of_week = v_current_dow
+                  AND (
+                      (mw.week_of_month = v_current_week_of_month)
+                      OR (mw.week_of_month = 5 AND v_is_last_of_month = 1)
+                  ))
+              -- SPECIFIC_DATE: matches exact date
+              OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_current_date)
+          )
+    ) AS in_maintenance_window;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Check maintenance window with details
+-- ============================================================================
+-- Returns details about current/upcoming maintenance windows
+-- Supports all schedule types: WEEKLY, MONTHLY_DAY, MONTHLY_WEEKDAY, SPECIFIC_DATE
+--
+-- Usage: CALL get_maintenance_window_status(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE get_maintenance_window_status(IN p_config_id INT)
+BEGIN
+    DECLARE v_current_dow TINYINT;
+    DECLARE v_current_dom TINYINT;
+    DECLARE v_current_week_of_month TINYINT;
+    DECLARE v_is_last_of_month TINYINT;
+    DECLARE v_current_date DATE;
+    DECLARE v_days_in_month TINYINT;
+    
+    SET v_current_date = CURDATE();
+    SET v_current_dow = DAYOFWEEK(NOW()) - 1;
+    SET v_current_dom = DAY(v_current_date);
+    SET v_current_week_of_month = CEIL(v_current_dom / 7);
+    SET v_days_in_month = DAY(LAST_DAY(v_current_date));
+    SET v_is_last_of_month = CASE WHEN v_current_dom + 7 > v_days_in_month THEN 1 ELSE 0 END;
+    
+    SELECT 
+        mw.window_id,
+        mw.window_name,
+        mw.schedule_type,
+        mw.description,
+        -- Schedule description
+        CASE mw.schedule_type
+            WHEN 'WEEKLY' THEN CONCAT('Every ', 
+                CASE mw.day_of_week
+                    WHEN 0 THEN 'Sunday'
+                    WHEN 1 THEN 'Monday'
+                    WHEN 2 THEN 'Tuesday'
+                    WHEN 3 THEN 'Wednesday'
+                    WHEN 4 THEN 'Thursday'
+                    WHEN 5 THEN 'Friday'
+                    WHEN 6 THEN 'Saturday'
+                END)
+            WHEN 'MONTHLY_DAY' THEN CONCAT('Monthly on day ', mw.day_of_month)
+            WHEN 'MONTHLY_WEEKDAY' THEN CONCAT(
+                CASE mw.week_of_month
+                    WHEN 1 THEN '1st '
+                    WHEN 2 THEN '2nd '
+                    WHEN 3 THEN '3rd '
+                    WHEN 4 THEN '4th '
+                    WHEN 5 THEN 'Last '
+                END,
+                CASE mw.day_of_week
+                    WHEN 0 THEN 'Sunday'
+                    WHEN 1 THEN 'Monday'
+                    WHEN 2 THEN 'Tuesday'
+                    WHEN 3 THEN 'Wednesday'
+                    WHEN 4 THEN 'Thursday'
+                    WHEN 5 THEN 'Friday'
+                    WHEN 6 THEN 'Saturday'
+                END,
+                ' of each month')
+            WHEN 'SPECIFIC_DATE' THEN CONCAT('One-time: ', mw.specific_date)
+        END AS schedule_description,
+        mw.start_time,
+        mw.end_time,
+        CASE WHEN mw.config_id IS NULL THEN 'GLOBAL' ELSE 'CONFIG-SPECIFIC' END AS scope,
+        -- Status: check if active now based on schedule type
+        CASE 
+            WHEN CURTIME() BETWEEN mw.start_time AND mw.end_time
+                 AND (
+                     (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_current_dow)
+                     OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_current_dom)
+                     OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                         AND mw.day_of_week = v_current_dow
+                         AND ((mw.week_of_month = v_current_week_of_month) 
+                              OR (mw.week_of_month = 5 AND v_is_last_of_month = 1)))
+                     OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_current_date)
+                 )
+            THEN 'ACTIVE NOW'
+            WHEN mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date < v_current_date
+            THEN 'EXPIRED'
+            ELSE 'SCHEDULED'
+        END AS status
+    FROM maintenance_windows mw
+    WHERE mw.is_active = TRUE
+      AND (mw.config_id = p_config_id OR mw.config_id IS NULL)
+    ORDER BY 
+        -- Active windows first
+        CASE 
+            WHEN CURTIME() BETWEEN mw.start_time AND mw.end_time
+                 AND (
+                     (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_current_dow)
+                     OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_current_dom)
+                     OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                         AND mw.day_of_week = v_current_dow
+                         AND ((mw.week_of_month = v_current_week_of_month) 
+                              OR (mw.week_of_month = 5 AND v_is_last_of_month = 1)))
+                     OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_current_date)
+                 )
+            THEN 0
+            ELSE 1
+        END,
+        mw.schedule_type,
+        mw.specific_date,
+        mw.day_of_week,
+        mw.start_time;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Check if migration is caught up to active binlog
+-- ============================================================================
+-- Returns migration sync status based on:
+--   1. All binlog_apply_checkpoints entries are COMPLETED
+--   2. processing_log shows "Reached active binlog" with binlog 1 ahead of last checkpoint
+--
+-- Usage: CALL get_migration_sync_status(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE get_migration_sync_status(IN p_config_id INT)
+BEGIN
+    SELECT 
+        CASE 
+            WHEN incomplete_checkpoints = 0 
+                 AND active_binlog_reached = 1 
+                 AND active_binlog_is_next = 1
+            THEN 'CAUGHT_UP'
+            WHEN incomplete_checkpoints > 0
+            THEN 'INCOMPLETE_CHECKPOINTS'
+            WHEN active_binlog_reached = 0
+            THEN 'ACTIVE_BINLOG_NOT_REACHED'
+            WHEN active_binlog_is_next = 0
+            THEN 'BINLOG_GAP_DETECTED'
+            ELSE 'UNKNOWN'
+        END AS migration_status,
+        incomplete_checkpoints,
+        last_completed_binlog,
+        last_completed_binlog_num,
+        active_binlog_file,
+        active_binlog_num,
+        active_binlog_reached
+    FROM (
+        SELECT 
+            -- Count non-COMPLETED checkpoints
+            (SELECT COUNT(*) 
+             FROM binlog_apply_checkpoints 
+             WHERE config_id = p_config_id 
+               AND apply_status != 'COMPLETED'
+            ) AS incomplete_checkpoints,
+            
+            -- Get latest completed source binlog file
+            (SELECT source_binlog_file 
+             FROM binlog_apply_checkpoints 
+             WHERE config_id = p_config_id 
+               AND apply_status = 'COMPLETED'
+             ORDER BY checkpoint_id DESC LIMIT 1
+            ) AS last_completed_binlog,
+            
+            -- Extract numeric suffix from last completed binlog
+            (SELECT CAST(SUBSTRING_INDEX(source_binlog_file, '.', -1) AS UNSIGNED)
+             FROM binlog_apply_checkpoints 
+             WHERE config_id = p_config_id 
+               AND apply_status = 'COMPLETED'
+             ORDER BY checkpoint_id DESC LIMIT 1
+            ) AS last_completed_binlog_num,
+            
+            -- Get binlog_file from "Reached active binlog" log entry
+            (SELECT binlog_file 
+             FROM processing_log 
+             WHERE config_id = p_config_id 
+               AND log_message LIKE 'Reached active binlog:%'
+             ORDER BY log_id DESC LIMIT 1
+            ) AS active_binlog_file,
+            
+            -- Extract numeric suffix from active binlog
+            (SELECT CAST(SUBSTRING_INDEX(binlog_file, '.', -1) AS UNSIGNED)
+             FROM processing_log 
+             WHERE config_id = p_config_id 
+               AND log_message LIKE 'Reached active binlog:%'
+             ORDER BY log_id DESC LIMIT 1
+            ) AS active_binlog_num,
+            
+            -- Check if "Reached active binlog" entry exists
+            (SELECT COUNT(*) > 0
+             FROM processing_log 
+             WHERE config_id = p_config_id 
+               AND log_message LIKE 'Reached active binlog:%'
+            ) AS active_binlog_reached
+    ) AS status_check
+    CROSS JOIN (
+        SELECT 
+            -- Check if active binlog is exactly 1 ahead of last completed
+            COALESCE(
+                (SELECT CAST(SUBSTRING_INDEX(binlog_file, '.', -1) AS UNSIGNED)
+                 FROM processing_log 
+                 WHERE config_id = p_config_id 
+                   AND log_message LIKE 'Reached active binlog:%'
+                 ORDER BY log_id DESC LIMIT 1
+                ) = 
+                (SELECT CAST(SUBSTRING_INDEX(source_binlog_file, '.', -1) AS UNSIGNED) + 1
+                 FROM binlog_apply_checkpoints 
+                 WHERE config_id = p_config_id 
+                   AND apply_status = 'COMPLETED'
+                 ORDER BY checkpoint_id DESC LIMIT 1
+                ),
+                0
+            ) AS active_binlog_is_next
+    ) AS gap_check;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Check if migration is blocked (simple boolean)
+-- ============================================================================
+-- Returns 1 if migration is blocked, 0 if OK
+-- Blocked conditions:
+--   1. Last checkpoint is INTERRUPTED, FAILED, or STARTED (incomplete)
+--   2. Blocking message exists in processing_log
+--
+-- Usage: CALL check_migration_blocked(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE check_migration_blocked(IN p_config_id INT)
+BEGIN
+    SELECT 
+        (
+            -- Last checkpoint is INTERRUPTED, FAILED, or STARTED (not COMPLETED)
+            EXISTS (
+                SELECT 1 FROM binlog_apply_checkpoints 
+                WHERE config_id = p_config_id
+                  AND apply_status IN ('INTERRUPTED', 'FAILED', 'STARTED')
+                ORDER BY checkpoint_id DESC LIMIT 1
+            )
+            OR
+            -- Blocking message exists in processing_log
+            EXISTS (
+                SELECT 1 FROM processing_log 
+                WHERE config_id = p_config_id
+                  AND log_message LIKE 'Processing blocked: % Manual intervention required'
+            )
+        ) AS is_blocked;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Check if migration is blocked (extended details)
+-- ============================================================================
+-- Returns detailed information about blocked migration state
+-- Includes checkpoint details and recovery information
+--
+-- Usage: CALL check_migration_blocked_extended(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE check_migration_blocked_extended(IN p_config_id INT)
+BEGIN
+    SELECT 
+        COALESCE(bac.checkpoint_id, 0) AS checkpoint_id,
+        bac.source_binlog_file,
+        bac.source_binlog_position,
+        bac.apply_status,
+        bac.error_message AS checkpoint_error,
+        bac.apply_started_at,
+        bac.apply_completed_at,
+        bac.target_binlog_file_before AS recovery_binlog,
+        bac.target_binlog_position_before AS recovery_position,
+        bac.target_gtid_before AS recovery_gtid,
+        pl.log_id AS blocking_log_id,
+        pl.log_message AS blocking_message,
+        pl.logged_at AS blocked_at,
+        CASE 
+            WHEN bac.apply_status IN ('INTERRUPTED', 'FAILED', 'STARTED')
+                 OR pl.log_id IS NOT NULL
+            THEN TRUE
+            ELSE FALSE
+        END AS is_blocked,
+        CASE 
+            WHEN bac.apply_status IN ('INTERRUPTED', 'FAILED', 'STARTED')
+                 OR pl.log_id IS NOT NULL
+            THEN 'BLOCKED - MANUAL INTERVENTION REQUIRED'
+            ELSE 'OK'
+        END AS status
+    FROM (SELECT 1) AS dummy
+    LEFT JOIN (
+        SELECT * FROM binlog_apply_checkpoints 
+        WHERE config_id = p_config_id
+        ORDER BY checkpoint_id DESC LIMIT 1
+    ) bac ON 1=1
+    LEFT JOIN (
+        SELECT * FROM processing_log 
+        WHERE config_id = p_config_id
+          AND log_message LIKE 'Processing blocked: % Manual intervention required'
+        ORDER BY log_id DESC LIMIT 1
+    ) pl ON 1=1;
 END//
 
 DELIMITER ;
