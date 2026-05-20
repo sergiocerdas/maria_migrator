@@ -33,12 +33,33 @@ for _var in PORT BINLOG_DIR WORKDIR LOG_FILE \
             DB_HOST DB_PORT DB_USER DB_PASSWORD DB_NAME DB_SSL\
             MIGRATION_NAME SOURCE_INSTANCE_NAME SOURCE_VIP_PORT \
             SOURCE_CLUSTER_ID TARGET_INSTANCE_NAME \
-            INITIAL_BINLOG INITIAL_POS; do
+            INITIAL_BINLOG INITIAL_POS \
+            PATCHING_NETWORK PATCHING_ENVIRONMENT PATCHING_SERVER_TYPE; do
     if [[ -z "${!_var:-}" ]]; then
         echo "ERROR: Required config variable '$_var' is not set in $CONFIG_FILE"
         exit 1
     fi
 done
+
+# Validate PATCHING_* variables have valid values
+PATCHING_NETWORK=$(echo "$PATCHING_NETWORK" | tr '[:lower:]' '[:upper:]')
+PATCHING_ENVIRONMENT=$(echo "$PATCHING_ENVIRONMENT" | tr '[:lower:]' '[:upper:]')
+PATCHING_SERVER_TYPE=$(echo "$PATCHING_SERVER_TYPE" | tr '[:lower:]' '[:upper:]')
+
+if [[ ! "$PATCHING_NETWORK" =~ ^(HTZ|SIZ|DMZ|IGBN)$ ]]; then
+    echo "ERROR: PATCHING_NETWORK must be HTZ, SIZ, DMZ, or IGBN (got: $PATCHING_NETWORK)"
+    exit 1
+fi
+
+if [[ ! "$PATCHING_ENVIRONMENT" =~ ^(PROD|PRE-PROD)$ ]]; then
+    echo "ERROR: PATCHING_ENVIRONMENT must be PROD or PRE-PROD (got: $PATCHING_ENVIRONMENT)"
+    exit 1
+fi
+
+if [[ ! "$PATCHING_SERVER_TYPE" =~ ^(VM|PHYSICAL)$ ]]; then
+    echo "ERROR: PATCHING_SERVER_TYPE must be VM or PHYSICAL (got: $PATCHING_SERVER_TYPE)"
+    exit 1
+fi
 
 # Validate SOURCE_CLUSTER_NODES array
 if [[ ${#SOURCE_CLUSTER_NODES[@]} -lt 2 ]]; then
@@ -888,6 +909,19 @@ if [[ -z "$CONFIG_ID" ]]; then
     done
 
     log "source_cluster_mapping populated for config_id=$CONFIG_ID"
+
+    ############################################
+    # CREATE PATCHING MAINTENANCE WINDOWS
+    ############################################
+    log "Creating patching maintenance windows..."
+    log "  Network: $PATCHING_NETWORK"
+    log "  Environment: $PATCHING_ENVIRONMENT"
+    log "  Server Type: $PATCHING_SERVER_TYPE"
+
+    db_query "CALL create_patching_maintenance_windows($CONFIG_ID, '$PATCHING_NETWORK', '$PATCHING_ENVIRONMENT', '$PATCHING_SERVER_TYPE');" \
+        || log "WARNING: Failed to create patching maintenance windows (non-fatal)"
+
+    log "Patching maintenance windows created for config_id=$CONFIG_ID"
 else
     log "Existing migration found → config_id=$CONFIG_ID (RESUMING)"
 fi

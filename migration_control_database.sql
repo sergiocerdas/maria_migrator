@@ -961,4 +961,210 @@ BEGIN
     ) pl ON 1=1;
 END//
 
+-- ============================================================================
+-- PROCEDURE: Create standard patching maintenance windows
+-- ============================================================================
+-- Inserts maintenance window records based on the organization's patching schedule.
+--
+-- Parameters:
+--   p_config_id   - Migration config ID (NULL = global, applies to all migrations)
+--   p_network     - 'HTZ', 'SIZ', 'DMZ' (weekly patching) or 'IGBN' (monthly patching)
+--   p_environment - 'PROD' or 'PRE-PROD'
+--   p_server_type - 'VM' or 'PHYSICAL'
+--
+-- Patching Schedule Matrix:
+-- ============================================================================
+-- HTZ/SIZ/DMZ Networks (WEEKLY patching):
+--   +-------------+----------+---------------------------+
+--   | Environment | Type     | Schedule                  |
+--   +-------------+----------+---------------------------+
+--   | PRE-PROD    | VM       | Every Monday 9PM PST (5h) |
+--   | PRE-PROD    | PHYSICAL | Every Monday 9PM PST (5h) |
+--   | PROD        | VM       | Every Wednesday 9PM PST (5h) |
+--   | PROD        | PHYSICAL | Every Saturday 6AM PST (5h) |
+--   +-------------+----------+---------------------------+
+--
+-- IGBN Network (MONTHLY patching):
+--   +-------------+----------+----------------------------------+
+--   | Environment | Type     | Schedule                         |
+--   +-------------+----------+----------------------------------+
+--   | PRE-PROD    | VM       | Last Monday of month 9PM PST (5h)|
+--   | PRE-PROD    | PHYSICAL | Last Monday of month 9PM PST (5h)|
+--   | PROD        | VM       | Last Wednesday of month 9PM PST (5h)|
+--   | PROD        | PHYSICAL | (none - no monthly patching)     |
+--   +-------------+----------+----------------------------------+
+--
+-- Note: Windows spanning midnight are split into two records.
+--
+-- Usage:
+--   CALL create_patching_maintenance_windows(NULL, 'HTZ', 'PROD', 'VM');
+--   CALL create_patching_maintenance_windows(NULL, 'IGBN', 'PRE-PROD', 'PHYSICAL');
+--   CALL create_patching_maintenance_windows(1, 'DMZ', 'PROD', 'PHYSICAL');
+-- ============================================================================
+CREATE PROCEDURE create_patching_maintenance_windows(
+    IN p_config_id INT,
+    IN p_network VARCHAR(20),
+    IN p_environment VARCHAR(20),
+    IN p_server_type VARCHAR(20)
+)
+proc_body: BEGIN
+    DECLARE v_network VARCHAR(20);
+    DECLARE v_env VARCHAR(20);
+    DECLARE v_type VARCHAR(20);
+    DECLARE v_window_prefix VARCHAR(100);
+    DECLARE v_is_weekly BOOLEAN;
+    
+    -- Normalize inputs to uppercase
+    SET v_network = UPPER(TRIM(p_network));
+    SET v_env = UPPER(TRIM(p_environment));
+    SET v_type = UPPER(TRIM(p_server_type));
+    
+    -- Validate inputs
+    IF v_network NOT IN ('HTZ', 'SIZ', 'DMZ', 'IGBN') THEN
+        SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = 'Invalid network. Must be HTZ, SIZ, DMZ, or IGBN';
+    END IF;
+    
+    IF v_env NOT IN ('PROD', 'PRE-PROD') THEN
+        SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = 'Invalid environment. Must be PROD or PRE-PROD';
+    END IF;
+    
+    IF v_type NOT IN ('VM', 'PHYSICAL') THEN
+        SIGNAL SQLSTATE '45000' 
+            SET MESSAGE_TEXT = 'Invalid server_type. Must be VM or PHYSICAL';
+    END IF;
+    
+    -- Determine if weekly (HTZ/SIZ/DMZ) or monthly (IGBN)
+    SET v_is_weekly = (v_network IN ('HTZ', 'SIZ', 'DMZ'));
+    
+    -- Build window name prefix including network
+    SET v_window_prefix = CONCAT(v_network, ' ', v_env, ' ', v_type, ' Patching');
+    
+    -- ========================================================================
+    -- HTZ/SIZ/DMZ Networks - WEEKLY PATCHING
+    -- ========================================================================
+    IF v_is_weekly THEN
+        
+        -- PRE-PROD (VMs and Physical): Monday 9PM PST (5h = until 2AM Tuesday)
+        IF v_env = 'PRE-PROD' THEN
+            -- Monday 9PM-midnight
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'WEEKLY', 1, '21:00:00', '23:59:59', 
+                 CONCAT(v_window_prefix, ' - Mon 9PM'),
+                 CONCAT('Weekly patching for PRE-PROD ', v_type, 's (', v_network, ') - Monday evening'));
+            
+            -- Tuesday midnight-2AM (continuation)
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'WEEKLY', 2, '00:00:00', '02:00:00', 
+                 CONCAT(v_window_prefix, ' - Tue 2AM'),
+                 CONCAT('Weekly patching for PRE-PROD ', v_type, 's (', v_network, ') - Tuesday morning'));
+        
+        -- PROD VMs: Wednesday 9PM PST (5h = until 2AM Thursday)
+        ELSEIF v_env = 'PROD' AND v_type = 'VM' THEN
+            -- Wednesday 9PM-midnight
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'WEEKLY', 3, '21:00:00', '23:59:59', 
+                 CONCAT(v_window_prefix, ' - Wed 9PM'),
+                 CONCAT('Weekly patching for PROD VMs (', v_network, ') - Wednesday evening'));
+            
+            -- Thursday midnight-2AM (continuation)
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'WEEKLY', 4, '00:00:00', '02:00:00', 
+                 CONCAT(v_window_prefix, ' - Thu 2AM'),
+                 CONCAT('Weekly patching for PROD VMs (', v_network, ') - Thursday morning'));
+        
+        -- PROD Physical: Saturday 6AM PST (5h = until 11AM Saturday)
+        ELSEIF v_env = 'PROD' AND v_type = 'PHYSICAL' THEN
+            -- Saturday 6AM-11AM (no midnight split needed)
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'WEEKLY', 6, '06:00:00', '11:00:00', 
+                 CONCAT(v_window_prefix, ' - Sat 6AM'),
+                 CONCAT('Weekly patching for PROD Physical Servers (', v_network, ') - Saturday morning'));
+        END IF;
+    
+    -- ========================================================================
+    -- IGBN Network - MONTHLY PATCHING
+    -- ========================================================================
+    ELSE
+        -- PRE-PROD (VMs and Physical): Last Monday 9PM PST (5h = until 2AM Tuesday)
+        IF v_env = 'PRE-PROD' THEN
+            -- Last Monday 9PM-midnight
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'MONTHLY_WEEKDAY', 1, 5, '21:00:00', '23:59:59', 
+                 CONCAT(v_window_prefix, ' - Last Mon 9PM'),
+                 CONCAT('Monthly patching for PRE-PROD ', v_type, 's (IGBN) - Last Monday evening'));
+            
+            -- Tuesday after last Monday, midnight-2AM (continuation)
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'MONTHLY_WEEKDAY', 2, 5, '00:00:00', '02:00:00', 
+                 CONCAT(v_window_prefix, ' - Last Mon cont.'),
+                 CONCAT('Monthly patching for PRE-PROD ', v_type, 's (IGBN) - Tuesday after last Monday'));
+        
+        -- PROD VMs: Last Wednesday 9PM PST (5h = until 2AM Thursday)
+        ELSEIF v_env = 'PROD' AND v_type = 'VM' THEN
+            -- Last Wednesday 9PM-midnight
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'MONTHLY_WEEKDAY', 3, 5, '21:00:00', '23:59:59', 
+                 CONCAT(v_window_prefix, ' - Last Wed 9PM'),
+                 'Monthly patching for PROD VMs (IGBN) - Last Wednesday evening');
+            
+            -- Thursday after last Wednesday, midnight-2AM (continuation)
+            INSERT INTO maintenance_windows 
+                (config_id, schedule_type, day_of_week, week_of_month, start_time, end_time, window_name, description)
+            VALUES 
+                (p_config_id, 'MONTHLY_WEEKDAY', 4, 5, '00:00:00', '02:00:00', 
+                 CONCAT(v_window_prefix, ' - Last Wed cont.'),
+                 'Monthly patching for PROD VMs (IGBN) - Thursday after last Wednesday');
+        
+        -- PROD Physical: NO monthly patching for IGBN
+        ELSEIF v_env = 'PROD' AND v_type = 'PHYSICAL' THEN
+            -- Return message that no windows are needed
+            SELECT 'No maintenance windows created: PROD Physical Servers on IGBN have no monthly patching schedule' AS message;
+            -- Early return - skip the summary query
+            LEAVE proc_body;
+        END IF;
+    END IF;
+    
+    -- Return summary of created windows
+    SELECT 
+        window_id,
+        window_name,
+        schedule_type,
+        CASE day_of_week
+            WHEN 0 THEN 'Sunday'
+            WHEN 1 THEN 'Monday'
+            WHEN 2 THEN 'Tuesday'
+            WHEN 3 THEN 'Wednesday'
+            WHEN 4 THEN 'Thursday'
+            WHEN 5 THEN 'Friday'
+            WHEN 6 THEN 'Saturday'
+        END AS day_name,
+        week_of_month,
+        start_time,
+        end_time,
+        description
+    FROM maintenance_windows
+    WHERE (config_id = p_config_id OR (p_config_id IS NULL AND config_id IS NULL))
+      AND window_name LIKE CONCAT(v_window_prefix, '%')
+    ORDER BY window_id DESC
+    LIMIT 10;
+END//
+
 DELIMITER ;
