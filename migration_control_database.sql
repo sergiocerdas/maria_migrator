@@ -1167,4 +1167,166 @@ proc_body: BEGIN
     LIMIT 10;
 END//
 
+-- ============================================================================
+-- PROCEDURE: Test maintenance window logic with simulated date/time
+-- ============================================================================
+-- Validates maintenance window logic by testing against a specific date/time.
+-- Useful for verifying windows will trigger correctly before actual patching.
+--
+-- Parameters:
+--   p_config_id  - Migration config ID to test
+--   p_test_datetime - DateTime to simulate (e.g., '2026-05-25 21:30:00')
+--                     If NULL, uses current datetime
+--
+-- Returns: Detailed analysis showing which windows match and why
+--
+-- Usage:
+--   -- Test if Monday 9:30 PM would be in maintenance
+--   CALL test_maintenance_window(1, '2026-05-25 21:30:00');
+--
+--   -- Test current time
+--   CALL test_maintenance_window(1, NULL);
+--
+--   -- Test last Monday of month at 9:30 PM
+--   CALL test_maintenance_window(1, '2026-05-25 21:30:00');
+--
+--   -- Test a Wednesday at 10 PM
+--   CALL test_maintenance_window(1, '2026-05-27 22:00:00');
+-- ============================================================================
+CREATE PROCEDURE test_maintenance_window(
+    IN p_config_id INT,
+    IN p_test_datetime DATETIME
+)
+BEGIN
+    DECLARE v_test_dt DATETIME;
+    DECLARE v_test_date DATE;
+    DECLARE v_test_time TIME;
+    DECLARE v_dow TINYINT;
+    DECLARE v_dom TINYINT;
+    DECLARE v_wom TINYINT;
+    DECLARE v_is_last TINYINT;
+    DECLARE v_days_in_month TINYINT;
+    DECLARE v_day_name VARCHAR(10);
+    
+    -- Use provided datetime or current
+    SET v_test_dt = COALESCE(p_test_datetime, NOW());
+    SET v_test_date = DATE(v_test_dt);
+    SET v_test_time = TIME(v_test_dt);
+    
+    -- Calculate date components
+    SET v_dow = DAYOFWEEK(v_test_dt) - 1;  -- 0=Sunday, 6=Saturday
+    SET v_dom = DAY(v_test_date);
+    SET v_wom = CEIL(v_dom / 7);
+    SET v_days_in_month = DAY(LAST_DAY(v_test_date));
+    SET v_is_last = CASE WHEN v_dom + 7 > v_days_in_month THEN 1 ELSE 0 END;
+    SET v_day_name = CASE v_dow
+        WHEN 0 THEN 'Sunday'
+        WHEN 1 THEN 'Monday'
+        WHEN 2 THEN 'Tuesday'
+        WHEN 3 THEN 'Wednesday'
+        WHEN 4 THEN 'Thursday'
+        WHEN 5 THEN 'Friday'
+        WHEN 6 THEN 'Saturday'
+    END;
+    
+    -- Output test parameters
+    SELECT 
+        '=== MAINTENANCE WINDOW TEST ===' AS section,
+        v_test_dt AS test_datetime,
+        v_test_date AS test_date,
+        v_test_time AS test_time,
+        v_day_name AS day_name,
+        v_dow AS day_of_week_num,
+        v_dom AS day_of_month,
+        v_wom AS week_of_month,
+        v_is_last AS is_last_occurrence,
+        v_days_in_month AS days_in_month,
+        p_config_id AS config_id;
+    
+    -- Check each maintenance window and show match status
+    SELECT 
+        mw.window_id,
+        mw.window_name,
+        mw.schedule_type,
+        mw.day_of_week AS mw_dow,
+        mw.day_of_month AS mw_dom,
+        mw.week_of_month AS mw_wom,
+        mw.specific_date AS mw_specific_date,
+        mw.start_time,
+        mw.end_time,
+        CASE WHEN mw.config_id IS NULL THEN 'GLOBAL' ELSE CONCAT('config_id=', mw.config_id) END AS scope,
+        -- Time check
+        CASE WHEN v_test_time BETWEEN mw.start_time AND mw.end_time 
+             THEN 'YES' ELSE 'NO' END AS time_matches,
+        -- Schedule type specific checks
+        CASE mw.schedule_type
+            WHEN 'WEEKLY' THEN 
+                CASE WHEN mw.day_of_week = v_dow THEN 'YES' ELSE 'NO' END
+            WHEN 'MONTHLY_DAY' THEN 
+                CASE WHEN mw.day_of_month = v_dom THEN 'YES' ELSE 'NO' END
+            WHEN 'MONTHLY_WEEKDAY' THEN 
+                CASE WHEN mw.day_of_week = v_dow 
+                          AND (mw.week_of_month = v_wom OR (mw.week_of_month = 5 AND v_is_last = 1))
+                     THEN 'YES' ELSE 'NO' END
+            WHEN 'SPECIFIC_DATE' THEN 
+                CASE WHEN mw.specific_date = v_test_date THEN 'YES' ELSE 'NO' END
+        END AS schedule_matches,
+        -- Overall match
+        CASE 
+            WHEN mw.is_active = TRUE
+                 AND v_test_time BETWEEN mw.start_time AND mw.end_time
+                 AND (
+                     (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_dow)
+                     OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_dom)
+                     OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                         AND mw.day_of_week = v_dow
+                         AND (mw.week_of_month = v_wom OR (mw.week_of_month = 5 AND v_is_last = 1)))
+                     OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_test_date)
+                 )
+            THEN '>>> IN MAINTENANCE <<<'
+            WHEN mw.is_active = FALSE
+            THEN 'DISABLED'
+            ELSE 'not in window'
+        END AS result
+    FROM maintenance_windows mw
+    WHERE mw.config_id = p_config_id OR mw.config_id IS NULL
+    ORDER BY 
+        CASE 
+            WHEN mw.is_active = TRUE
+                 AND v_test_time BETWEEN mw.start_time AND mw.end_time
+                 AND (
+                     (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_dow)
+                     OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_dom)
+                     OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                         AND mw.day_of_week = v_dow
+                         AND (mw.week_of_month = v_wom OR (mw.week_of_month = 5 AND v_is_last = 1)))
+                     OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_test_date)
+                 )
+            THEN 0
+            ELSE 1
+        END,
+        mw.window_id;
+    
+    -- Summary: would processing be blocked?
+    SELECT 
+        CASE 
+            WHEN EXISTS (
+                SELECT 1 FROM maintenance_windows mw
+                WHERE mw.is_active = TRUE
+                  AND (mw.config_id = p_config_id OR mw.config_id IS NULL)
+                  AND v_test_time BETWEEN mw.start_time AND mw.end_time
+                  AND (
+                      (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = v_dow)
+                      OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = v_dom)
+                      OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+                          AND mw.day_of_week = v_dow
+                          AND (mw.week_of_month = v_wom OR (mw.week_of_month = 5 AND v_is_last = 1)))
+                      OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = v_test_date)
+                  )
+            )
+            THEN CONCAT('BLOCKED: Migration would skip processing at ', v_test_dt)
+            ELSE CONCAT('OK: Migration would process normally at ', v_test_dt)
+        END AS final_result;
+END//
+
 DELIMITER ;

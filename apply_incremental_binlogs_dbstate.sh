@@ -317,6 +317,7 @@ db_log_critical() {
 # before processing can continue. This prevents applying binlogs when:
 #   1. There are ERROR entries in processing_log (newer than last acknowledgment)
 #   2. There are non-COMPLETED checkpoints (STARTED, FAILED, INTERRUPTED)
+#   3. Target instance has gtid_strict_mode = ON (incompatible with binlog apply)
 #
 # Returns: 0 if OK to proceed, 1 if blocked
 ############################################
@@ -324,6 +325,7 @@ check_blocking_conditions() {
     local error_ack_timestamp
     local error_count
     local checkpoint_count
+    local gtid_strict_mode
     local blocked=0
     
     log "Checking for blocking error conditions..."
@@ -395,6 +397,45 @@ check_blocking_conditions() {
         log ""
     fi
     
+    # Check 3: Target instance gtid_strict_mode must be OFF
+    # When gtid_strict_mode is ON, the target will reject binlog events from a different server_id
+    gtid_strict_mode=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+        --skip-column-names --batch \
+        -e "SELECT @@gtid_strict_mode;" 2>/dev/null || echo "UNKNOWN")
+    
+    if [[ "$gtid_strict_mode" == "1" || "$gtid_strict_mode" == "ON" ]]; then
+        blocked=1
+        log ""
+        log "============================================================"
+        log "BLOCKING CONDITION: Target instance has gtid_strict_mode = ON"
+        log "============================================================"
+        log ""
+        log "Target host: $TARGET_HOST:$TARGET_PORT"
+        log "gtid_strict_mode: $gtid_strict_mode"
+        log ""
+        log "With gtid_strict_mode enabled, the target instance will reject binlog"
+        log "events from the source instance because they have a different server_id."
+        log "This will cause all binlog apply operations to fail."
+        log ""
+        log "To fix this, run on the TARGET instance:"
+        log ""
+        log "  SET GLOBAL gtid_strict_mode = OFF;"
+        log ""
+        log "To make this persistent across restarts, add to my.cnf:"
+        log ""
+        log "  [mysqld]"
+        log "  gtid_strict_mode = OFF"
+        log ""
+        log "============================================================"
+    elif [[ "$gtid_strict_mode" == "UNKNOWN" ]]; then
+        log "WARNING: Could not check gtid_strict_mode on target instance"
+        log "         Target: $TARGET_HOST:$TARGET_PORT"
+        log "         Proceeding, but binlog apply may fail if gtid_strict_mode is ON"
+    else
+        log "Target gtid_strict_mode: OFF (OK)"
+    fi
+    
     if [[ $blocked -eq 1 ]]; then
         log "============================================================"
         log "MANUAL INTERVENTION REQUIRED"
@@ -408,27 +449,40 @@ check_blocking_conditions() {
         log "Processing is BLOCKED due to the above condition(s)."
         log "Review the errors and take corrective action before continuing."
         log ""
-        log "To acknowledge errors and unblock processing, run:"
+        log "For ERROR entries or incomplete checkpoints:"
         log ""
-        log "  UPDATE migration_status"
-        log "  SET error_acknowledged_at = NOW()"
-        log "  WHERE config_id = $CONFIG_ID;"
+        log "  To acknowledge errors and unblock processing, run:"
         log ""
-        log "If there are incomplete checkpoints, you must ALSO either:"
-        log "  1. Verify target data integrity and mark as COMPLETED:"
-        log "     UPDATE binlog_apply_checkpoints"
-        log "     SET apply_status = 'COMPLETED', apply_completed_at = NOW(),"
-        log "         error_message = 'Manually verified by operator'"
-        log "     WHERE config_id = $CONFIG_ID AND apply_status != 'COMPLETED';"
+        log "    UPDATE migration_status"
+        log "    SET error_acknowledged_at = NOW()"
+        log "    WHERE config_id = $CONFIG_ID;"
         log ""
-        log "  OR"
+        log "  If there are incomplete checkpoints, you must ALSO either:"
+        log "    1. Verify target data integrity and mark as COMPLETED:"
+        log "       UPDATE binlog_apply_checkpoints"
+        log "       SET apply_status = 'COMPLETED', apply_completed_at = NOW(),"
+        log "           error_message = 'Manually verified by operator'"
+        log "       WHERE config_id = $CONFIG_ID AND apply_status != 'COMPLETED';"
         log ""
-        log "  2. Perform flashback recovery using target_binlog_file_before"
-        log "     and target_binlog_position_before from the checkpoint record."
+        log "    OR"
+        log ""
+        log "    2. Perform flashback recovery using target_binlog_file_before"
+        log "       and target_binlog_position_before from the checkpoint record."
+        log ""
+        log "For gtid_strict_mode = ON:"
+        log ""
+        log "  Run on the TARGET instance: SET GLOBAL gtid_strict_mode = OFF;"
         log ""
         log "============================================================"
         
-        db_log_warn "Processing blocked: $error_count unacknowledged error(s), $checkpoint_count incomplete checkpoint(s). Manual intervention required." "" "" ""
+        # Build blocking reason string
+        local blocking_reasons=""
+        [[ "$error_count" -gt 0 ]] && blocking_reasons="${blocking_reasons}${error_count} error(s), "
+        [[ "$checkpoint_count" -gt 0 ]] && blocking_reasons="${blocking_reasons}${checkpoint_count} incomplete checkpoint(s), "
+        [[ "$gtid_strict_mode" == "1" || "$gtid_strict_mode" == "ON" ]] && blocking_reasons="${blocking_reasons}gtid_strict_mode=ON, "
+        blocking_reasons="${blocking_reasons%, }"  # Remove trailing comma
+        
+        db_log_warn "Processing blocked: $blocking_reasons. Manual intervention required." "" "" ""
         
         return 1
     fi
@@ -918,10 +972,25 @@ if [[ -z "$CONFIG_ID" ]]; then
     log "  Environment: $PATCHING_ENVIRONMENT"
     log "  Server Type: $PATCHING_SERVER_TYPE"
 
-    db_query "CALL create_patching_maintenance_windows($CONFIG_ID, '$PATCHING_NETWORK', '$PATCHING_ENVIRONMENT', '$PATCHING_SERVER_TYPE');" \
+    # Call the stored procedure (suppress verbose table output)
+    db_query "CALL create_patching_maintenance_windows($CONFIG_ID, '$PATCHING_NETWORK', '$PATCHING_ENVIRONMENT', '$PATCHING_SERVER_TYPE');" >/dev/null 2>&1 \
         || log "WARNING: Failed to create patching maintenance windows (non-fatal)"
 
-    log "Patching maintenance windows created for config_id=$CONFIG_ID"
+    # Log a summary of created windows
+    _window_count=$(db_scalar "SELECT COUNT(*) FROM maintenance_windows WHERE config_id = $CONFIG_ID;")
+    if [[ -n "$_window_count" && "$_window_count" -gt 0 ]]; then
+        log "Maintenance windows created: $_window_count window(s) for config_id=$CONFIG_ID"
+        # Log each window on its own line for clarity
+        mysql --host="$DB_HOST" --user="$DB_USER" --password="$DB_PASSWORD" \
+              --port="$DB_PORT" $DB_SSL --skip-column-names --batch "$DB_NAME" \
+              -e "SELECT CONCAT('  [', window_id, '] ', window_name, ' (', schedule_type, ') ', start_time, '-', end_time) 
+                  FROM maintenance_windows WHERE config_id = $CONFIG_ID ORDER BY window_id;" 2>/dev/null \
+            | while IFS= read -r _line; do
+                log "$_line"
+            done
+    else
+        log "No maintenance windows created (check network/environment/server_type combination)"
+    fi
 else
     log "Existing migration found → config_id=$CONFIG_ID (RESUMING)"
 fi
@@ -957,79 +1026,121 @@ fi
 log "Migration is not paused — continuing"
 
 ############################################
-# MAINTENANCE WINDOW CHECK
+# REBOOT/SHUTDOWN CHECK
 ############################################
-section "MAINTENANCE WINDOW CHECK"
+section "REBOOT/SHUTDOWN CHECK"
 
-# Check if currently in a maintenance window (config-specific or global)
-# Supports schedule types: WEEKLY, MONTHLY_DAY, MONTHLY_WEEKDAY, SPECIFIC_DATE
-#
-# Variables used in SQL:
-#   v_dow: day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
-#   v_dom: day of month (1-31)
-#   v_wom: week of month (1-5, which occurrence of this weekday)
-#   v_is_last: 1 if this is the last occurrence of this weekday in the month
-#   v_date: current date
-#
-IN_MAINTENANCE=$(db_scalar "
-    SELECT EXISTS (
-        SELECT 1 FROM maintenance_windows mw,
-        (SELECT 
-            DAYOFWEEK(NOW()) - 1 AS v_dow,
-            DAY(CURDATE()) AS v_dom,
-            CEIL(DAY(CURDATE()) / 7) AS v_wom,
-            CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
-            CURDATE() AS v_date
-        ) vars
-        WHERE mw.is_active = TRUE
-          AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
-          AND CURTIME() BETWEEN mw.start_time AND mw.end_time
-          AND (
-              -- WEEKLY: matches day of week
-              (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
-              -- MONTHLY_DAY: matches day of month (1-31)
-              OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
-              -- MONTHLY_WEEKDAY: matches Nth weekday (1-4) or last weekday (5)
-              OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
-                  AND mw.day_of_week = vars.v_dow
-                  AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
-              -- SPECIFIC_DATE: matches exact date
-              OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
-          )
-    ) AS in_window;")
-
-if [[ "$IN_MAINTENANCE" == "1" ]]; then
-    # Get window details for logging
-    WINDOW_INFO=$(db_scalar "
-        SELECT CONCAT(mw.window_name, ' (', mw.schedule_type, ')') 
-        FROM maintenance_windows mw,
-        (SELECT 
-            DAYOFWEEK(NOW()) - 1 AS v_dow,
-            DAY(CURDATE()) AS v_dom,
-            CEIL(DAY(CURDATE()) / 7) AS v_wom,
-            CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
-            CURDATE() AS v_date
-        ) vars
-        WHERE mw.is_active = TRUE
-          AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
-          AND CURTIME() BETWEEN mw.start_time AND mw.end_time
-          AND (
-              (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
-              OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
-              OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
-                  AND mw.day_of_week = vars.v_dow
-                  AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
-              OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
-          )
-        LIMIT 1;")
-    
-    log "Currently in maintenance window: '$WINDOW_INFO' — skipping this iteration"
-    db_log_info "Skipping iteration: in maintenance window '$WINDOW_INFO'" "" "" ""
+# Check if system is scheduled for shutdown/reboot (systemd)
+if [[ -f /run/systemd/shutdown/scheduled ]]; then
+    log "System shutdown/reboot is scheduled — skipping this iteration to avoid interrupting migration during reboot"
+    db_log_info "Skipping iteration: system shutdown/reboot is scheduled" "" "" ""
     trap - EXIT
     exit 0
 fi
 
-log "Not in maintenance window — continuing"
+# Check if shutdown/reboot process is actively running
+if pgrep -x "shutdown" >/dev/null 2>&1 || pgrep -x "reboot" >/dev/null 2>&1; then
+    log "Shutdown/reboot process is actively running — skipping this iteration"
+    db_log_info "Skipping iteration: shutdown/reboot process running" "" "" ""
+    trap - EXIT
+    exit 0
+fi
+
+# Check system runlevel - runlevel 0 = halt, 6 = reboot
+CURRENT_RUNLEVEL=$(runlevel 2>/dev/null | awk '{print $2}' || echo "unknown")
+if [[ "$CURRENT_RUNLEVEL" == "0" || "$CURRENT_RUNLEVEL" == "6" ]]; then
+    log "System is in runlevel $CURRENT_RUNLEVEL (shutdown/reboot) — skipping this iteration"
+    db_log_info "Skipping iteration: system in runlevel $CURRENT_RUNLEVEL" "" "" ""
+    trap - EXIT
+    exit 0
+fi
+
+log "No pending reboot/shutdown detected — continuing"
+
+############################################
+# MAINTENANCE WINDOW CHECK (DISABLED)
+############################################
+# NOTE: Maintenance window check is currently DISABLED.
+# To re-enable, uncomment the section below.
+# The maintenance_windows table and stored procedures remain available
+# for testing via: CALL test_maintenance_window(<CONFIG_ID>, '<DATETIME>');
+############################################
+section "MAINTENANCE WINDOW CHECK"
+log "Maintenance window check is DISABLED — skipping"
+
+# --- BEGIN DISABLED MAINTENANCE WINDOW CHECK ---
+# section "MAINTENANCE WINDOW CHECK"
+#
+# # Check if currently in a maintenance window (config-specific or global)
+# # Supports schedule types: WEEKLY, MONTHLY_DAY, MONTHLY_WEEKDAY, SPECIFIC_DATE
+# #
+# # Variables used in SQL:
+# #   v_dow: day of week (0=Sunday, 1=Monday, ..., 6=Saturday)
+# #   v_dom: day of month (1-31)
+# #   v_wom: week of month (1-5, which occurrence of this weekday)
+# #   v_is_last: 1 if this is the last occurrence of this weekday in the month
+# #   v_date: current date
+# #
+# IN_MAINTENANCE=$(db_scalar "
+#     SELECT EXISTS (
+#         SELECT 1 FROM maintenance_windows mw,
+#         (SELECT 
+#             DAYOFWEEK(NOW()) - 1 AS v_dow,
+#             DAY(CURDATE()) AS v_dom,
+#             CEIL(DAY(CURDATE()) / 7) AS v_wom,
+#             CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
+#             CURDATE() AS v_date
+#         ) vars
+#         WHERE mw.is_active = TRUE
+#           AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
+#           AND CURTIME() BETWEEN mw.start_time AND mw.end_time
+#           AND (
+#               -- WEEKLY: matches day of week
+#               (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
+#               -- MONTHLY_DAY: matches day of month (1-31)
+#               OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
+#               -- MONTHLY_WEEKDAY: matches Nth weekday (1-4) or last weekday (5)
+#               OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+#                   AND mw.day_of_week = vars.v_dow
+#                   AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
+#               -- SPECIFIC_DATE: matches exact date
+#               OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
+#           )
+#     ) AS in_window;")
+#
+# if [[ "$IN_MAINTENANCE" == "1" ]]; then
+#     # Get window details for logging
+#     WINDOW_INFO=$(db_scalar "
+#         SELECT CONCAT(mw.window_name, ' (', mw.schedule_type, ')') 
+#         FROM maintenance_windows mw,
+#         (SELECT 
+#             DAYOFWEEK(NOW()) - 1 AS v_dow,
+#             DAY(CURDATE()) AS v_dom,
+#             CEIL(DAY(CURDATE()) / 7) AS v_wom,
+#             CASE WHEN DAY(CURDATE()) + 7 > DAY(LAST_DAY(CURDATE())) THEN 1 ELSE 0 END AS v_is_last,
+#             CURDATE() AS v_date
+#         ) vars
+#         WHERE mw.is_active = TRUE
+#           AND (mw.config_id = $CONFIG_ID OR mw.config_id IS NULL)
+#           AND CURTIME() BETWEEN mw.start_time AND mw.end_time
+#           AND (
+#               (mw.schedule_type = 'WEEKLY' AND mw.day_of_week = vars.v_dow)
+#               OR (mw.schedule_type = 'MONTHLY_DAY' AND mw.day_of_month = vars.v_dom)
+#               OR (mw.schedule_type = 'MONTHLY_WEEKDAY' 
+#                   AND mw.day_of_week = vars.v_dow
+#                   AND (mw.week_of_month = vars.v_wom OR (mw.week_of_month = 5 AND vars.v_is_last = 1)))
+#               OR (mw.schedule_type = 'SPECIFIC_DATE' AND mw.specific_date = vars.v_date)
+#           )
+#         LIMIT 1;")
+#     
+#     log "Currently in maintenance window: '$WINDOW_INFO' — skipping this iteration"
+#     db_log_info "Skipping iteration: in maintenance window '$WINDOW_INFO'" "" "" ""
+#     trap - EXIT
+#     exit 0
+# fi
+#
+# log "Not in maintenance window — continuing"
+# --- END DISABLED MAINTENANCE WINDOW CHECK ---
 
 ############################################
 # FAILOVER RESUME DETECTION (NEW PRIMARY)
