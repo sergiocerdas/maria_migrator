@@ -348,4 +348,86 @@ CALL get_migration_sync_status(<CONFIG_ID>);
 | `BINLOG_GAP_DETECTED` | Gap between completed and active binlog | NO - Investigate |
 | `UNKNOWN` | Unable to determine status | NO - Investigate |
 
+---
+
+## Cutover Process: Kill All User Sessions on Source Instance
+
+During cutover, you need to terminate all user sessions on the source instance to ensure no new changes are written. This allows you to flush the binary logs and have the migration process apply the final binlog.
+
+### Cutover Query to Kill User Sessions
+
+Run this against the source instance to generate and review KILL statements:
+
+```sql
+-- Generate and execute KILL statements for all user sessions
+-- Excludes: system threads, replication threads, and the current session
+
+-- Option 1: Generate KILL statements (review before executing)
+SELECT CONCAT('KILL ', id, ';') AS kill_statement
+FROM information_schema.processlist
+WHERE id != CONNECTION_ID()                              -- Exclude current session
+  AND user NOT IN ('system user', 'event_scheduler')     -- Exclude system threads
+  AND command NOT IN ('Binlog Dump', 'Binlog Dump GTID') -- Exclude replication to slaves
+  AND (user NOT LIKE 'rpl%' AND user NOT LIKE 'repl%')   -- Exclude replication users
+  AND user != 'root'                                     -- Optional: exclude root if needed for monitoring
+ORDER BY time DESC;
+
+-- Option 2: Execute kills directly via prepared statement
+-- WARNING: This will immediately disconnect all matching sessions
+SET @kills = NULL;
+SELECT GROUP_CONCAT(CONCAT('KILL ', id) SEPARATOR '; ') INTO @kills
+FROM information_schema.processlist
+WHERE id != CONNECTION_ID()
+  AND user NOT IN ('system user', 'event_scheduler')
+  AND command NOT IN ('Binlog Dump', 'Binlog Dump GTID')
+  AND user NOT LIKE 'rpl%' 
+  AND user NOT LIKE 'repl%';
+
+-- Review what will be killed
+SELECT @kills;
+
+-- Execute (uncomment when ready)
+-- PREPARE stmt FROM @kills;
+-- EXECUTE stmt;
+-- DEALLOCATE PREPARE stmt;
+```
+
+### Bash One-Liner for Cutover
+
+Kill all user sessions on source, then flush binary logs to create the final binlog:
+
+```bash
+# Kill all user sessions on source, then flush binary logs
+mysql -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root -p"$ROOT_PASS" -e "
+SELECT CONCAT('KILL ', id, ';') 
+FROM information_schema.processlist 
+WHERE id != CONNECTION_ID() 
+  AND user NOT IN ('system user', 'event_scheduler')
+  AND command NOT IN ('Binlog Dump', 'Binlog Dump GTID')
+  AND user NOT LIKE 'rpl%'
+" --skip-column-names | mysql -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root -p"$ROOT_PASS"
+
+# Flush to create final binlog
+mysql -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root -p"$ROOT_PASS" -e "FLUSH BINARY LOGS;"
+```
+
+### Recommended Cutover Sequence
+
+1. **Set source to read-only** (prevents new writes):
+   ```sql
+   SET GLOBAL read_only = ON;
+   ```
+
+2. **Kill remaining user sessions** (using query above)
+
+3. **Flush binary logs** (creates clean final binlog):
+   ```sql
+   FLUSH BINARY LOGS;
+   ```
+
+4. **Wait for migration** to process final binlog
+
+5. **Verify GTID positions match** between source and target
+
+6. **Switch DNS/VIP** to target instance
 
