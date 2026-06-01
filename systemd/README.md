@@ -431,3 +431,26 @@ mysql -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root -p"$ROOT_PASS" -e "FLUSH BINAR
 
 6. **Switch DNS/VIP** to target instance
 
+
+
+
+### Disable Bin Log logging (for changing user's password without transaction being replicated during migration): 
+
+
+1. **Disable binary log logging** 
+      SET sql_log_bin = 0;
+
+2. **Confirm change** 
+      show variables like 'sql_log_bin';
+         Sample output:
+         +---------------+-------+
+         | Variable_name | Value |
+         +---------------+-------+
+         | sql_log_bin   | OFF   |
+         +---------------+-------+
+         1 row in set (0.001 sec)
+3. **Any transaction performed after this point won't generate any binary log movement**
+
+4. **Enable back binary log logging** 
+      SET sql_log_bin = 1;
+
