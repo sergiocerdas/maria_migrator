@@ -76,6 +76,21 @@ CLUSTER_NODES=("${SOURCE_CLUSTER_NODES[@]}")
 
 echo "CLUSTER_NODES: (${CLUSTER_NODES[*]})"
 
+############################################
+# OPTIONAL DATABASE FILTER
+# Build --database arguments for mariadb-binlog if FILTER_DATABASES is set
+############################################
+DATABASE_FILTER_ARGS=()
+if [[ -n "${FILTER_DATABASES+x}" && ${#FILTER_DATABASES[@]} -gt 0 ]]; then
+    echo "Database filter enabled for: ${FILTER_DATABASES[*]}"
+    for db in "${FILTER_DATABASES[@]}"; do
+        DATABASE_FILTER_ARGS+=("--database=$db")
+    done
+    echo "Filter arguments: ${DATABASE_FILTER_ARGS[*]}"
+else
+    echo "No database filter configured - processing all databases"
+fi
+
 
 ############################################
 # LOGGING HELPERS
@@ -576,10 +591,54 @@ apply_binlog_to_target() {
     ############################################
     # APPLY SQL TO TARGET
     ############################################
+    
+    # TESTING: To enable partial database migration mode:
+    # 1. Set SKIP_MISSING_DB_ERRORS=true in migration.cfg
+    # 2. Comment out the "Standard apply" block below
+    # 3. Uncomment the "Partial migration mode" block
+    
+    # --- Standard apply (comment out for partial migration) ---
     output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
         "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
         < "$sql_file" 2>&1)
     rc=$?
+    # --- End standard apply ---
+    
+    # --- Partial migration mode (uncomment to enable) ---
+    # Uses --force to continue past errors for non-existent databases/tables
+    # Filters "expected" errors (1049, 1146, 1051) from critical errors
+    # Requires SKIP_MISSING_DB_ERRORS=true in migration.cfg
+    #
+    # local error_file="$WORKDIR/${binlog_file}.apply_errors"
+    # output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+    #     "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+    #     --force \
+    #     < "$sql_file" 2>&1 | tee "$error_file")
+    # rc=${PIPESTATUS[0]}
+    # 
+    # # Filter expected vs critical errors
+    # # Expected (ignorable): 1049=Unknown database, 1146=Table doesn't exist, 1051=Unknown table
+    # local critical_errors=""
+    # if [[ -s "$error_file" ]]; then
+    #     critical_errors=$(grep -E "^ERROR" "$error_file" | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true)
+    #     local skipped_count=$(grep -cE "ERROR 1049|ERROR 1146|ERROR 1051" "$error_file" || echo "0")
+    #     if [[ "$skipped_count" -gt 0 ]]; then
+    #         log "INFO: Skipped $skipped_count statements for non-migrated databases/tables"
+    #     fi
+    # fi
+    # 
+    # # Override rc: only fail if there are CRITICAL errors
+    # if [[ -n "$critical_errors" ]]; then
+    #     log "CRITICAL errors found during apply:"
+    #     log "$critical_errors"
+    #     rc=1
+    #     output="$critical_errors"
+    # else
+    #     rc=0
+    #     output=""
+    # fi
+    # rm -f "$error_file"
+    # --- End partial migration mode ---
     
     ############################################
     # HANDLE SUCCESS
@@ -1406,6 +1465,19 @@ BINLOG_CMD=(
     "$BINLOG_PATH"
 )
 
+# TESTING: Uncomment the following block to enable database filtering
+# This will filter binlog transactions to only include specified databases
+# configured in FILTER_DATABASES array in migration.cfg
+# if [[ ${#DATABASE_FILTER_ARGS[@]} -gt 0 ]]; then
+#     BINLOG_CMD=(
+#         "$MYSQL_BINLOG"
+#         "--start-position=$CURRENT_POS"
+#         "${DATABASE_FILTER_ARGS[@]}"
+#         "$BINLOG_PATH"
+#     )
+#     log "Database filter active: ${DATABASE_FILTER_ARGS[*]}"
+# fi
+
 log "Executing command:"
 log "${BINLOG_CMD[*]} > $SQL_FILE 2> $ERR_FILE"
 db_log_info "Extracting binlog contents: $CURRENT_BINLOG (start_pos=$CURRENT_POS)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
@@ -1598,6 +1670,16 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             "--stop-position=$FAILOVER_POS" \
             "$BINLOG_PATH" > "$PRE_FAILOVER_SQL" 2>/dev/null || true
 
+        # TESTING: Uncomment to enable database filtering for pre-failover extraction
+        # if [[ ${#DATABASE_FILTER_ARGS[@]} -gt 0 ]]; then
+        #     "$MYSQL_BINLOG" \
+        #         "--start-position=$BINLOG_START_POS" \
+        #         "--stop-position=$FAILOVER_POS" \
+        #         "${DATABASE_FILTER_ARGS[@]}" \
+        #         "$BINLOG_PATH" > "$PRE_FAILOVER_SQL" 2>/dev/null || true
+        #     log "Database filter active for pre-failover: ${DATABASE_FILTER_ARGS[*]}"
+        # fi
+
         # NOTE: We do NOT filter maintenance transactions from pre-failover SQL.
         # Text-based GTID block filtering can accidentally capture unrelated events.
         # Maintenance ops (truncate slow_log, etc.) are harmless to apply to target.
@@ -1606,6 +1688,7 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
         fi
 
         if [[ -s "$PRE_FAILOVER_SQL" ]]; then
+            # --- Standard apply (comment out for partial migration) ---
             if "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
                     "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
                     < "$PRE_FAILOVER_SQL"; then
@@ -1613,6 +1696,16 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
             else
                 log "WARNING: Failed to apply pre-failover SQL — target may be incomplete"
             fi
+            # --- End standard apply ---
+            
+            # --- Partial migration mode (uncomment to enable) ---
+            # Uses --force to skip errors for non-existent databases/tables
+            # "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+            #         "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+            #         --force \
+            #         < "$PRE_FAILOVER_SQL" 2>&1 | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true
+            # log "Pre-failover transactions applied with --force (partial migration mode)"
+            # --- End partial migration mode ---
         else
             log "No pre-failover transactions to apply (empty SQL output for this range)"
         fi
