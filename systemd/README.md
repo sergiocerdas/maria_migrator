@@ -343,10 +343,120 @@ CALL get_migration_sync_status(<CONFIG_ID>);
 | migration_status | Meaning | Cutover Ready? |
 |------------------|---------|----------------|
 | `CAUGHT_UP` | All binlogs applied, target is in sync | **YES** |
-| `INCOMPLETE_CHECKPOINTS` | Some checkpoints failed/interrupted | NO - Fix first |
+| `INCOMPLETE_CHECKPOINTS` | Checkpoint in STARTED/FAILED/INTERRUPTED state (see note below) | NO - Check duration |
 | `ACTIVE_BINLOG_NOT_REACHED` | Still processing historical binlogs | NO - Wait |
-| `BINLOG_GAP_DETECTED` | Gap between completed and active binlog | NO - Investigate |
-| `UNKNOWN` | Unable to determine status | NO - Investigate |
+| `BINLOG_GAP_DETECTED` | Gap between completed and active binlog | NO - **FAILED** |
+| `UNKNOWN` | Unable to determine status | NO - **FAILED** |
+
+**Status Interpretation Notes:**
+
+- **`INCOMPLETE_CHECKPOINTS`**: This status may appear if the procedure is called while a binlog apply is in progress (checkpoint status = `STARTED`). This is normal during active processing. However, if `INCOMPLETE_CHECKPOINTS` persists for longer than the average apply time (see `get_avg_binlog_apply_time`), the migration should be considered **FAILED** and requires investigation.
+
+- **`BINLOG_GAP_DETECTED`** / **`UNKNOWN`**: These statuses indicate the migration instance has **FAILED**. Mark the migration as failed and investigate the root cause before attempting recovery.
+
+
+
+---
+
+### Check Binlogs Remaining: `get_binlogs_remaining`
+
+**Purpose:** Get the number of binlogs still pending to be applied.
+
+**When to use:** Monitor sync progress, estimate time to cutover.
+
+```sql
+CALL get_binlogs_remaining(<CONFIG_ID>);
+```
+
+**Returns:**
+
+| binlogs_remaining | Meaning |
+|-------------------|----------|
+| `0` | Fully caught up — current binlog equals active binlog |
+| `N` | N binlogs still need to be applied |
+| `NULL` | Missing data or server name mismatch |
+
+**Example:**
+```
++-------------------+
+| binlogs_remaining |
++-------------------+
+|                 7 |
++-------------------+
+```
+
+This indicates 7 binlogs remain to be processed before the migration is caught up.
+
+**Automation Example (bash):**
+
+```bash
+#!/bin/bash
+CONFIG_ID=1
+REMAINING=$(mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p"$DB_PASSWORD" $DB_NAME \
+    -N -B -e "CALL get_binlogs_remaining($CONFIG_ID);" 2>/dev/null)
+
+if [[ "$REMAINING" == "NULL" ]] || [[ -z "$REMAINING" ]]; then
+    echo "WARNING: Unable to determine binlogs remaining"
+    exit 1
+elif [[ "$REMAINING" == "0" ]]; then
+    echo "OK: Migration is caught up"
+    exit 0
+else
+    echo "INFO: $REMAINING binlogs remaining to apply"
+    exit 0
+fi
+```
+
+---
+
+### Check Average Apply Time: `get_avg_binlog_apply_time`
+
+**Purpose:** Get the average time (in seconds) to apply a single binlog.
+
+**When to use:** Estimate time to cutover, capacity planning, performance monitoring.
+
+```sql
+CALL get_avg_binlog_apply_time(<CONFIG_ID>);
+```
+
+**Returns:**
+
+| avg_completion_seconds | Meaning |
+|------------------------|----------|
+| `-1` | No completed checkpoints or missing timestamp data |
+| `N` | Average N seconds to apply each binlog |
+
+**Example:**
+```
++------------------------+
+| avg_completion_seconds |
++------------------------+
+|                   12.5 |
++------------------------+
+```
+
+**Estimating Time to Cutover:**
+
+Combine with `get_binlogs_remaining` to estimate cutover readiness:
+
+```bash
+#!/bin/bash
+CONFIG_ID=1
+
+REMAINING=$(mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p"$DB_PASSWORD" $DB_NAME \
+    -N -B -e "CALL get_binlogs_remaining($CONFIG_ID);" 2>/dev/null)
+
+AVG_TIME=$(mysql -h $DB_HOST -P $DB_PORT -u $DB_USER -p"$DB_PASSWORD" $DB_NAME \
+    -N -B -e "CALL get_avg_binlog_apply_time($CONFIG_ID);" 2>/dev/null)
+
+if [[ "$REMAINING" != "NULL" ]] && [[ "$AVG_TIME" != "-1" ]]; then
+    EST_SECONDS=$(echo "$REMAINING * $AVG_TIME" | bc)
+    EST_MINUTES=$(echo "scale=1; $EST_SECONDS / 60" | bc)
+    echo "Estimated time to catch up: $EST_MINUTES minutes ($REMAINING binlogs × $AVG_TIME sec/binlog)"
+else
+    echo "Unable to estimate - insufficient data"
+fi
+```
 
 ---
 
@@ -413,23 +523,18 @@ mysql -h "$SOURCE_HOST" -P "$SOURCE_PORT" -u root -p"$ROOT_PASS" -e "FLUSH BINAR
 
 ### Recommended Cutover Sequence
 
-1. **Set source to read-only** (prevents new writes):
-   ```sql
-   SET GLOBAL read_only = ON;
-   ```
+1. **Kill remaining user sessions** (using query above)
 
-2. **Kill remaining user sessions** (using query above)
-
-3. **Flush binary logs** (creates clean final binlog):
+2. **Flush binary logs** (creates clean final binlog):
    ```sql
    FLUSH BINARY LOGS;
    ```
 
-4. **Wait for migration** to process final binlog
+3. **Wait for migration** to process final binlog
 
-5. **Verify GTID positions match** between source and target
+4. **Verify GTID positions match** between source and target
 
-6. **Switch DNS/VIP** to target instance
+5. **Switch DNS/VIP** to target instance
 
 
 

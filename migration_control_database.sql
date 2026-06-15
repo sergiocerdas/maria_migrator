@@ -37,8 +37,8 @@ CREATE TABLE migration_config (
     migration_password_encrypted TEXT NOT NULL, -- AES encrypted
     
     -- Status and Control
-    is_active BOOLEAN DEFAULT FALSE,
-    is_paused BOOLEAN DEFAULT TRUE, -- Start in paused state until operator explicitly starts migration
+    is_active BOOLEAN DEFAULT TRUE,
+    is_paused BOOLEAN DEFAULT FALSE,
     
     -- Metadata
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -239,6 +239,13 @@ CREATE TABLE migration_status (
     total_binlogs_processed INT DEFAULT 0,
     total_transactions_processed BIGINT DEFAULT 0,
     total_maintenance_operations_ignored INT DEFAULT 0,
+    
+    -- Source cluster active binlog tracking
+    -- Tracks the current active binlog on the source primary node
+    -- Updated on each binlog apply iteration to monitor sync progress
+    source_active_binlog_file VARCHAR(255),
+    source_active_binlog_position BIGINT UNSIGNED,
+    source_active_binlog_checked_at TIMESTAMP NULL,
     
     -- Error acknowledgment tracking
     -- When NULL, any ERROR logs or non-COMPLETED checkpoints will block processing
@@ -878,6 +885,74 @@ BEGIN
                 0
             ) AS active_binlog_is_next
     ) AS gap_check;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Get number of binlogs remaining to apply
+-- ============================================================================
+-- Calculates how many binlogs are still pending based on:
+--   - current_binlog_file: The binlog currently being processed
+--   - source_active_binlog_file: The active binlog on the processing node
+--
+-- Both values come from migration_status table and are updated during processing.
+-- The server name portion of both binlog files must match (same processing node).
+--
+-- Returns: Single integer value (binlogs_remaining)
+--   - NULL if data is missing or server names don't match
+--   - 0 if caught up (current = active)
+--   - N if N binlogs remain to be applied
+--
+-- Usage: CALL get_binlogs_remaining(<CONFIG_ID>);
+--
+-- Example:
+--   current_binlog_file: binlogs_d2fm1mar143.000396
+--   source_active_binlog_file: binlogs_d2fm1mar143.000403
+--   binlogs_remaining: 7
+-- ============================================================================
+CREATE PROCEDURE get_binlogs_remaining(IN p_config_id INT)
+BEGIN
+    SELECT 
+        CASE 
+            WHEN ms.current_binlog_file IS NULL OR ms.source_active_binlog_file IS NULL
+            THEN NULL
+            WHEN SUBSTRING_INDEX(SUBSTRING_INDEX(ms.current_binlog_file, '.', 1), '_', -1) != 
+                 SUBSTRING_INDEX(SUBSTRING_INDEX(ms.source_active_binlog_file, '.', 1), '_', -1)
+            THEN NULL
+            ELSE GREATEST(0, 
+                CAST(SUBSTRING_INDEX(ms.source_active_binlog_file, '.', -1) AS UNSIGNED) -
+                CAST(SUBSTRING_INDEX(ms.current_binlog_file, '.', -1) AS UNSIGNED)
+            )
+        END AS binlogs_remaining
+    FROM migration_status ms
+    WHERE ms.config_id = p_config_id;
+END//
+
+-- ============================================================================
+-- PROCEDURE: Get average binlog apply completion time
+-- ============================================================================
+-- Calculates the average time (in seconds) to apply a binlog based on
+-- completed checkpoint records in binlog_apply_checkpoints table.
+--
+-- Returns: Single numeric value (avg_completion_seconds)
+--   - -1 if no completed checkpoints exist or missing timestamp data
+--   - Average seconds to apply a binlog otherwise
+--
+-- Usage: CALL get_avg_binlog_apply_time(<CONFIG_ID>);
+-- ============================================================================
+CREATE PROCEDURE get_avg_binlog_apply_time(IN p_config_id INT)
+BEGIN
+    SELECT 
+        COALESCE(
+            (SELECT AVG(TIMESTAMPDIFF(SECOND, apply_started_at, apply_completed_at))
+             FROM binlog_apply_checkpoints
+             WHERE config_id = p_config_id
+               AND apply_status = 'COMPLETED'
+               AND apply_started_at IS NOT NULL
+               AND apply_completed_at IS NOT NULL
+             HAVING COUNT(*) > 0
+            ),
+            -1
+        ) AS avg_completion_seconds;
 END//
 
 -- ============================================================================

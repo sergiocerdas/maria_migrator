@@ -326,6 +326,110 @@ db_log_critical() {
 }
 
 ############################################
+# GET CURRENT PRIMARY NODE
+############################################
+# Checks all cluster nodes to determine which one is the current primary.
+# A node is considered primary if read_only = OFF.
+#
+# Returns via stdout:
+#   - Primary node hostname if found
+#   - Empty string if no primary found
+#
+# Sets global variables:
+#   CURRENT_PRIMARY_HOST     - Hostname of the primary node
+#   CURRENT_PRIMARY_SERVER_ID - server_id of the primary node
+#
+# Usage:
+#   primary=$(get_current_primary)
+#   if [[ -n "$primary" ]]; then
+#       echo "Primary is: $primary"
+#   fi
+############################################
+get_current_primary() {
+    local node
+    local is_read_only
+    local slave_status
+    local connect_result
+    local primary_host=""
+    local primary_server_id=""
+    
+    for node in "${CLUSTER_NODES[@]}"; do
+        # Try to connect and get read_only status
+        is_read_only=$(mysql --host="$node" --user=mysql01 --port="$PORT" \
+            --skip-column-names --batch \
+            -e "SELECT @@read_only;" 2>/dev/null)
+        connect_result=$?
+        
+        if [[ $connect_result -ne 0 ]]; then
+            log "  Node $node: Could not connect (skipping)"
+            continue
+        fi
+        
+        if [[ "$is_read_only" == "0" ]]; then
+            # read_only = OFF means this is the primary
+            primary_host="$node"
+            primary_server_id=$(mysql --host="$node" --user=mysql01 --port="$PORT" \
+                --skip-column-names --batch \
+                -e "SELECT @@server_id;" 2>/dev/null || echo "")
+            log "  Node $node: PRIMARY (read_only=OFF, server_id=$primary_server_id)"
+            break
+        else
+            # read_only = ON, check if it's a healthy secondary
+            slave_status=$(mysql --host="$node" --user=mysql01 --port="$PORT" \
+                --skip-column-names --batch \
+                -e "SHOW SLAVE STATUS\G" 2>/dev/null || echo "")
+            
+            local slave_sql_running=$(echo "$slave_status" | grep -i "Slave_SQL_Running:" | awk '{print tolower($2)}')
+            local slave_io_running=$(echo "$slave_status" | grep -i "Slave_IO_Running:" | awk '{print tolower($2)}')
+            
+            if [[ "$slave_sql_running" == "yes" && "$slave_io_running" == "yes" ]]; then
+                log "  Node $node: SECONDARY (read_only=ON, replication OK)"
+            else
+                log "  Node $node: SECONDARY (read_only=ON, replication status: SQL=$slave_sql_running IO=$slave_io_running)"
+            fi
+        fi
+    done
+    
+    # Set global variables for caller convenience
+    CURRENT_PRIMARY_HOST="$primary_host"
+    CURRENT_PRIMARY_SERVER_ID="$primary_server_id"
+    
+    echo "$primary_host"
+}
+
+############################################
+# GET PRIMARY NODE ID FROM DATABASE
+############################################
+# Resolves the primary node's node_id and server_id from the control database
+# based on the hostname returned by get_current_primary.
+#
+# Parameters:
+#   $1 - Primary hostname (from get_current_primary)
+#
+# Returns via stdout:
+#   - node_id if found
+#   - Empty string if not found
+#
+# Sets global variables:
+#   CURRENT_PRIMARY_NODE_ID  - node_id from cluster_nodes table
+############################################
+get_primary_node_id() {
+    local primary_host="$1"
+    local node_id=""
+    
+    if [[ -z "$primary_host" ]]; then
+        echo ""
+        return
+    fi
+    
+    node_id=$(db_scalar "SELECT node_id FROM cluster_nodes 
+        WHERE LOWER(node_name) = LOWER('${primary_host//\'/\'\'}') LIMIT 1;")
+    
+    CURRENT_PRIMARY_NODE_ID="$node_id"
+    echo "$node_id"
+}
+
+############################################
 # BLOCKING CONDITIONS CHECK
 ############################################
 # Checks for unresolved error conditions that require manual intervention
@@ -598,10 +702,10 @@ apply_binlog_to_target() {
     # 3. Uncomment the "Partial migration mode" block
     
     # --- Standard apply (comment out for partial migration) ---
-    output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
-        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
-        < "$sql_file" 2>&1)
-    rc=$?
+    #output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+    #    "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+    #    < "$sql_file" 2>&1)
+    #rc=$?
     # --- End standard apply ---
     
     # --- Partial migration mode (uncomment to enable) ---
@@ -609,35 +713,35 @@ apply_binlog_to_target() {
     # Filters "expected" errors (1049, 1146, 1051) from critical errors
     # Requires SKIP_MISSING_DB_ERRORS=true in migration.cfg
     #
-    # local error_file="$WORKDIR/${binlog_file}.apply_errors"
-    # output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
-    #     "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
-    #     --force \
-    #     < "$sql_file" 2>&1 | tee "$error_file")
-    # rc=${PIPESTATUS[0]}
-    # 
-    # # Filter expected vs critical errors
-    # # Expected (ignorable): 1049=Unknown database, 1146=Table doesn't exist, 1051=Unknown table
-    # local critical_errors=""
-    # if [[ -s "$error_file" ]]; then
-    #     critical_errors=$(grep -E "^ERROR" "$error_file" | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true)
-    #     local skipped_count=$(grep -cE "ERROR 1049|ERROR 1146|ERROR 1051" "$error_file" || echo "0")
-    #     if [[ "$skipped_count" -gt 0 ]]; then
-    #         log "INFO: Skipped $skipped_count statements for non-migrated databases/tables"
-    #     fi
-    # fi
-    # 
-    # # Override rc: only fail if there are CRITICAL errors
-    # if [[ -n "$critical_errors" ]]; then
-    #     log "CRITICAL errors found during apply:"
-    #     log "$critical_errors"
-    #     rc=1
-    #     output="$critical_errors"
-    # else
-    #     rc=0
-    #     output=""
-    # fi
-    # rm -f "$error_file"
+    local error_file="$WORKDIR/${binlog_file}.apply_errors"
+    output=$("$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+        --force \
+        < "$sql_file" 2>&1 | tee "$error_file")
+    rc=${PIPESTATUS[0]}
+    
+    # Filter expected vs critical errors
+    # Expected (ignorable): 1049=Unknown database, 1146=Table doesn't exist, 1051=Unknown table
+    local critical_errors=""
+    if [[ -s "$error_file" ]]; then
+        critical_errors=$(grep -E "^ERROR" "$error_file" | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true)
+        local skipped_count=$(grep -cE "ERROR 1049|ERROR 1146|ERROR 1051" "$error_file" || echo "0")
+        if [[ "$skipped_count" -gt 0 ]]; then
+            log "INFO: Skipped $skipped_count statements for non-migrated databases/tables"
+        fi
+    fi
+     
+    # Override rc: only fail if there are CRITICAL errors
+    if [[ -n "$critical_errors" ]]; then
+        log "CRITICAL errors found during apply:"
+        log "$critical_errors"
+        rc=1
+        output="$critical_errors"
+    else
+        rc=0
+        output=""
+    fi
+    rm -f "$error_file"
     # --- End partial migration mode ---
     
     ############################################
@@ -1689,22 +1793,22 @@ if [[ -n "$ALL_FOREIGN_LINES" ]]; then
 
         if [[ -s "$PRE_FAILOVER_SQL" ]]; then
             # --- Standard apply (comment out for partial migration) ---
-            if "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
-                    "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
-                    < "$PRE_FAILOVER_SQL"; then
-                log "Pre-failover transactions applied to target (up to position $FAILOVER_POS)"
-            else
-                log "WARNING: Failed to apply pre-failover SQL — target may be incomplete"
-            fi
+            #if "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+            #        "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+            #        < "$PRE_FAILOVER_SQL"; then
+            #    log "Pre-failover transactions applied to target (up to position $FAILOVER_POS)"
+            #else
+            #    log "WARNING: Failed to apply pre-failover SQL — target may be incomplete"
+            #fi
             # --- End standard apply ---
             
             # --- Partial migration mode (uncomment to enable) ---
             # Uses --force to skip errors for non-existent databases/tables
-            # "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
-            #         "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
-            #         --force \
-            #         < "$PRE_FAILOVER_SQL" 2>&1 | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true
-            # log "Pre-failover transactions applied with --force (partial migration mode)"
+            "$MYSQL" "--host=$TARGET_HOST" "--user=$TARGET_USER" \
+                    "--password=$TARGET_PASS" "--port=$TARGET_PORT" "--ssl=true" \
+                    --force \
+                    < "$PRE_FAILOVER_SQL" 2>&1 | grep -vE "ERROR 1049|ERROR 1146|ERROR 1051" || true
+            log "Pre-failover transactions applied with --force (partial migration mode)"
             # --- End partial migration mode ---
         else
             log "No pre-failover transactions to apply (empty SQL output for this range)"
@@ -1874,9 +1978,43 @@ PROCESSING_STATE="APPLYING"
 PROCESSING_BINLOG="$CURRENT_BINLOG"
 PROCESSING_POSITION="$CURRENT_POS"
 
+############################################
+# TRACK SOURCE ACTIVE BINLOG
+############################################
+# Query the current processing node (local node) to get its active binlog position.
+# This helps monitor how far behind the migration is from the source.
+log "Querying current processing node for active binlog position..."
+
+SOURCE_MASTER_STATUS=$(mysql --host="$HOSTNAME_SHORT" --user=mysql01 --port="$PORT" \
+    --skip-column-names --batch \
+    -e "SHOW MASTER STATUS;" 2>/dev/null || true)
+
+if [[ -n "$SOURCE_MASTER_STATUS" ]]; then
+    SOURCE_ACTIVE_BINLOG=$(echo "$SOURCE_MASTER_STATUS" | awk '{print $1}')
+    SOURCE_ACTIVE_POS=$(echo "$SOURCE_MASTER_STATUS" | awk '{print $2}')
+    
+    log "Current processing node ($HOSTNAME_SHORT) active binlog: $SOURCE_ACTIVE_BINLOG:$SOURCE_ACTIVE_POS"
+    
+    # Update migration_status with source active binlog info
+    db_query "UPDATE migration_status SET \
+        source_active_binlog_file = '${SOURCE_ACTIVE_BINLOG//\'/\'\'}', \
+        source_active_binlog_position = $SOURCE_ACTIVE_POS, \
+        source_active_binlog_checked_at = NOW() \
+        WHERE config_id = $CONFIG_ID;" 2>/dev/null || log "WARNING: Failed to update source active binlog info"
+else
+    log "WARNING: Could not get MASTER STATUS from current processing node $HOSTNAME_SHORT"
+fi
+
 if [[ "$BINLOG_IN_USE" -eq 1 ]]; then
     log "Binlog is still in use and no failover handoff was triggered — skipping apply and state advancement"
-    db_log_info "Reached active binlog: $CURRENT_BINLOG (processed $TOTAL_BINLOGS_PROCESSED binlog(s) this run)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    
+    # Log with source active binlog info if available
+    if [[ -n "${SOURCE_ACTIVE_BINLOG:-}" ]]; then
+        db_log_info "Reached active binlog: $CURRENT_BINLOG (processing node active: $SOURCE_ACTIVE_BINLOG:$SOURCE_ACTIVE_POS, processed $TOTAL_BINLOGS_PROCESSED binlog(s) this run)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    else
+        db_log_info "Reached active binlog: $CURRENT_BINLOG (processed $TOTAL_BINLOGS_PROCESSED binlog(s) this run)" "$CURRENT_BINLOG" "$CURRENT_POS" ""
+    fi
+    
     rm -f "$SQL_FILE" "$ERR_FILE"
     PROCESSING_STATE="COMPLETED_BINLOG_IN_USE"
     break  # Exit loop - reached active binlog
